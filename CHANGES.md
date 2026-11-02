@@ -624,5 +624,6 @@ drafts about 5 and stops where its confidence drops, the accepted count per roun
 each verified row is paid in attention. Lookup's 200k-token backward scan per round is not what costs; the rows are.
 
 Adopted: the exponential in PV is the default (0.5% on a 200k-token prefill, inside the noise elsewhere, 152 attention
-cases exact), and the server's first 6-head prompt attention line names where the exponential runs. Lookup drafting
-stays in the tree as an opt-in switch, for a greedy or a calibrated-row experiment; it is not forwarded by default.
+cases exact). The route's one-time log line names where the exponential runs, though the server does not surface that
+line (it never has; the route is live: LLAMA_FA_GQA6_Q8=0 costs 1-3% of prefill at 16k-40k tokens). Lookup drafting
+stays in the tree as an opt-in switch, for a greedy or a calibrated-row experiment.
