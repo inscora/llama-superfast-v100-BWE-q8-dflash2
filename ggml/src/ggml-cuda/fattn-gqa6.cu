@@ -91,8 +91,13 @@ namespace threadblock {
 
 // 1Cat's EpilogueVisitorSoftmaxV37 with ggml's mask. For each row of a 256-key tile it stores the FP16 probabilities
 // exp(logit - tile max), the FP32 tile max (-inf if every key is masked) and the FP32 sum of the rounded probabilities.
+// [TAG_GQA6_EXP_PV] ExpInPV (LLAMA_FA_GQA6_EXP_PV=1): the row stores (logit - tile max) * log2(e) as FP16 instead of the
+// probability, and no sum: the PV GEMM's A transform takes the exponential (one MUFU an element, under its tensor-core loop)
+// and accumulates the row's mass. 1Cat's sm70_79t kernel makes the same move (its QK epilogue stores FP16 logits, PV
+// applies the exponential while it loads) and runs 1.6x faster than the v37 kernel this route came from; ours keeps the
+// exact tile maximum and the FP32 rescale, so only the exponential and the sum leave the epilogue
 template <typename ThreadblockShape_, int ThreadCount, typename OutputTileIterator_, typename ElementAccumulator_,
-          typename ElementNorm_, typename ElementSum_, typename ElementSoftmaxCompute_>
+          typename ElementNorm_, typename ElementSum_, typename ElementSoftmaxCompute_, bool ExpInPV = false>
 class EpilogueVisitorSoftmaxGqa6 {
  public:
   using ThreadblockShape = ThreadblockShape_;
@@ -245,31 +250,35 @@ class EpilogueVisitorSoftmaxGqa6 {
       SoftmaxFragment values;
       CUTLASS_PRAGMA_UNROLL
       for (int e = 0; e < kElementsPerAccess; ++e) {
-        values[e] = fast_exp(row_logits_[c][e] - centre);
+        if constexpr (ExpInPV) {
+          values[e] = (row_logits_[c][e] - centre) * ElementSoftmaxCompute(1.4426950408889634f);
+        } else {
+          values[e] = fast_exp(row_logits_[c][e] - centre);
+        }
       }
       reinterpret_cast<OutputVector*>(&fragment_D_)[first_row_fragment_ + c] = convert(values);
     }
-    // Match the mass of the probabilities actually consumed by PV.
-    ElementSoftmaxCompute rounded_sum = ElementSoftmaxCompute(0);
-    CUTLASS_PRAGMA_UNROLL
-    for (int c = 0; c < kColumnIterations; ++c) {
-      int const fragment = first_row_fragment_ + c;
-      int const column = iterator_D_.thread_start().column() + OutputTileIterator::ThreadMap::iteration_offset(fragment).column();
-      OutputVector const& probabilities = reinterpret_cast<OutputVector const*>(&fragment_D_)[fragment];
+    ElementNorm* curr_ptr_max = ptr_Max_ + thread_offset_.row() + column_offset_;
+    arch::global_store<ElementNorm, sizeof(ElementNorm)>(ElementNorm(accum_max_), (void*)curr_ptr_max, is_write_thread);
+    if constexpr (!ExpInPV) {
+      // Match the mass of the probabilities actually consumed by PV.
+      ElementSoftmaxCompute rounded_sum = ElementSoftmaxCompute(0);
       CUTLASS_PRAGMA_UNROLL
-      for (int e = 0; e < kElementsPerAccess; ++e) {
-        if (column + e < extent_.column()) {
-          rounded_sum += ElementSoftmaxCompute(probabilities[e]);
+      for (int c = 0; c < kColumnIterations; ++c) {
+        int const fragment = first_row_fragment_ + c;
+        int const column = iterator_D_.thread_start().column() + OutputTileIterator::ThreadMap::iteration_offset(fragment).column();
+        OutputVector const& probabilities = reinterpret_cast<OutputVector const*>(&fragment_D_)[fragment];
+        CUTLASS_PRAGMA_UNROLL
+        for (int e = 0; e < kElementsPerAccess; ++e) {
+          if (column + e < extent_.column()) {
+            rounded_sum += ElementSoftmaxCompute(probabilities[e]);
+          }
         }
       }
+      ElementSoftmaxCompute const accum_sum = warp_reduce_sum_(rounded_sum);
+      ElementSum* curr_ptr_sum = ptr_Sum_ + thread_offset_.row() + column_offset_;
+      arch::global_store<ElementSum, sizeof(ElementSum)>(ElementSum(accum_sum), (void*)curr_ptr_sum, is_write_thread);
     }
-    ElementSoftmaxCompute const accum_sum = warp_reduce_sum_(rounded_sum);
-
-    ElementNorm* curr_ptr_max = ptr_Max_ + thread_offset_.row() + column_offset_;
-    ElementSum* curr_ptr_sum = ptr_Sum_ + thread_offset_.row() + column_offset_;
-
-    arch::global_store<ElementNorm, sizeof(ElementNorm)>(ElementNorm(accum_max_), (void*)curr_ptr_max, is_write_thread);
-    arch::global_store<ElementSum, sizeof(ElementSum)>(ElementSum(accum_sum), (void*)curr_ptr_sum, is_write_thread);
   }
 
   CUTLASS_DEVICE
@@ -331,10 +340,14 @@ using QKDefault = typename cutlass::gemm::kernel::DefaultGemm<
                                                              Element, Element, float>::Operator,
     cutlass::gemm::SharedMemoryClearOption::kNone>::GemmKernel;
 using QKMma = typename QKDefault::Mma;
-using QKVisitor = cutlass::epilogue::threadblock::EpilogueVisitorSoftmaxGqa6<
-    TBShape, QKDefault::kThreadCount, typename QKDefault::Epilogue::OutputTileIterator, float, float, float, float>;
-using QKEpilogue = typename cutlass::epilogue::threadblock::EpilogueWithVisitorFromExistingEpilogue<
-    QKVisitor, typename QKDefault::Epilogue>::Epilogue;
+template <bool ExpInPV>
+using QKVisitorT = cutlass::epilogue::threadblock::EpilogueVisitorSoftmaxGqa6<
+    TBShape, QKDefault::kThreadCount, typename QKDefault::Epilogue::OutputTileIterator, float, float, float, float, ExpInPV>;
+using QKVisitor = QKVisitorT<false>;
+template <bool ExpInPV>
+using QKEpilogueT = typename cutlass::epilogue::threadblock::EpilogueWithVisitorFromExistingEpilogue<
+    QKVisitorT<ExpInPV>, typename QKDefault::Epilogue>::Epilogue;
+using QKEpilogue = QKEpilogueT<false>;
 
 union QKSharedStorage {
   typename QKMma::SharedStorage main_loop;
@@ -343,6 +356,7 @@ union QKSharedStorage {
     typename QKVisitor::SharedStorage visitor;
   } epilogue;
 };
+static_assert(sizeof(typename QKEpilogueT<true>::SharedStorage) == sizeof(typename QKEpilogue::SharedStorage), "one QK workspace");
 
 struct QKParams {
   int rows_pad;  // GEMM M
@@ -361,6 +375,7 @@ struct QKParams {
   typename QKVisitor::Params visitor;
 };
 
+template <bool ExpInPV>
 static __global__ void __launch_bounds__(QKDefault::kThreadCount, 1) gqa6_qk_kernel(const QKParams p) {
   extern __shared__ int4 gqa6_smem_qk[];
   QKSharedStorage& shared = *reinterpret_cast<QKSharedStorage*>(gqa6_smem_qk);
@@ -382,11 +397,13 @@ static __global__ void __launch_bounds__(QKDefault::kThreadCount, 1) gqa6_qk_ker
   accumulators.clear();
   mma(kHeadDim / TBShape::kK, accumulators, iterator_A, iterator_B, accumulators);
 
-  QKVisitor visitor(p.visitor, shared.epilogue.visitor, {p.rows_pad, p.width}, thread_idx, warp_idx, lane_idx, p.params_D,
+  // the visitor's Params is a nested type: the same four fields for either variant
+  const typename QKVisitorT<ExpInPV>::Params vp = { p.visitor.scale, p.visitor.mask, p.visitor.mask_stride, p.visitor.rows };
+  QKVisitorT<ExpInPV> visitor(vp, *reinterpret_cast<typename QKVisitorT<ExpInPV>::SharedStorage*>(&shared.epilogue.visitor), {p.rows_pad, p.width}, thread_idx, warp_idx, lane_idx, p.params_D,
                     p.scores + head * p.scores_head_stride, p.tile_max + head * p.stats_head_stride,
                     p.tile_sum + head * p.stats_head_stride, {tile_m * TBShape::kM, tile_n * TBShape::kN},
                     tile_n * p.rows_pad);
-  QKEpilogue epilogue(shared.epilogue.epilogue, thread_idx, warp_idx, lane_idx);
+  QKEpilogueT<ExpInPV> epilogue(shared.epilogue.epilogue, thread_idx, warp_idx, lane_idx);
   epilogue(visitor, accumulators);
 }
 
@@ -396,7 +413,7 @@ static __global__ void gqa6_block_update(const float* __restrict__ tile_max, con
                                          float* __restrict__ tile_scale, float* __restrict__ run_max,
                                          float* __restrict__ run_sum, float* __restrict__ old_scale,
                                          float* __restrict__ block_scale, const int rows_pad, const int n_tiles,
-                                         const int64_t stats_head_stride, const bool first) {
+                                         const int64_t stats_head_stride, const bool first, const bool exp_pv) {
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
   const int head = blockIdx.y;
   if (row >= rows_pad) {
@@ -415,7 +432,7 @@ static __global__ void gqa6_block_update(const float* __restrict__ tile_max, con
     const float m = tm[t * int64_t(rows_pad)];
     const float scale = m == -INFINITY ? 0.0f : expf(m - block_max);
     tsc[t * int64_t(rows_pad)] = scale;
-    block_mass += ts[t * int64_t(rows_pad)] * scale;
+    block_mass += exp_pv ? 0.0f : ts[t * int64_t(rows_pad)] * scale; // [TAG_GQA6_EXP_PV] PV's mass is folded in after it
   }
 
   const int64_t i = head * int64_t(rows_pad) + row;
@@ -521,7 +538,8 @@ using PVSmemIteratorB = typename PVDefaultMma::SmemIteratorB;
 
 // Rescales each loaded probability by its 256-key tile's scale exp(tile max - block max) (ExpRowSumTransformA). The next
 // fragment's scales are loaded one call ahead, when it starts a new tile.
-struct PVTransformA {
+template <bool ExpInPV>
+struct PVTransformAT {
   using InputFragment = typename PVIteratorA::Fragment;
   using OutputFragment = cutlass::Array<typename PVSmemIteratorA::Element, InputFragment::kElements>;
   using ThreadMap = typename PVIteratorA::ThreadMap;
@@ -536,16 +554,22 @@ struct PVTransformA {
   int tile;      // tile of the scales held in tile_scale
   int row[kStridedIterations];
   float tile_scale[kStridedIterations];
+  // [TAG_GQA6_EXP_PV] the fragments past k_end are the pipeline's masked look-ahead (zeros: no exponential, no mass); the
+  // row's mass so far, kept here and mirrored to this thread's slots of the block's shared array after every fragment
+  int k_end;
+  float* mass;
+  float acc[kStridedIterations];
 
   CUTLASS_DEVICE
-  PVTransformA(float const* scale_, int rows_pad_, int n_tiles, int k_begin, int row_begin)
-      : scale(scale_), rows_pad(rows_pad_), last_tile(n_tiles - 1), k_offset(k_begin) {
+  PVTransformAT(float const* scale_, int rows_pad_, int n_tiles, int k_begin, int row_begin, int k_end_ = 0, float* mass_ = nullptr)
+      : scale(scale_), rows_pad(rows_pad_), last_tile(n_tiles - 1), k_offset(k_begin), k_end(k_end_), mass(mass_) {
     const auto thread_offset = ThreadMap::initial_offset(threadIdx.x);
     tile = min(k_offset / kTileKeys, last_tile);
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < kStridedIterations; ++s) {
       row[s] = row_begin + thread_offset.strided() + s * ThreadMap::Delta::kStrided;
       tile_scale[s] = scale[tile * int64_t(rows_pad) + row[s]];
+      acc[s] = 0.0f;
     }
   }
 
@@ -555,9 +579,11 @@ struct PVTransformA {
     constexpr int kElementsPerAccess = PVIteratorA::AccessType::kElements;
     auto const* input_access = reinterpret_cast<typename PVIteratorA::AccessType const*>(&input);
     auto* output_access = reinterpret_cast<typename PVIteratorA::AccessType*>(&output);
+    const bool valid = !ExpInPV || k_offset < k_end;
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < kStridedIterations; ++s) {
       const float probability_scale = tile_scale[s];
+      float m = 0.0f;
       CUTLASS_PRAGMA_UNROLL
       for (int c = 0; c < kContiguousIterations; ++c) {
         CUTLASS_PRAGMA_UNROLL
@@ -566,10 +592,21 @@ struct PVTransformA {
           typename PVIteratorA::AccessType transformed;
           CUTLASS_PRAGMA_UNROLL
           for (int e = 0; e < kElementsPerAccess; ++e) {
-            transformed[e] = Element(static_cast<float>(input_access[index][e]) * probability_scale);
+            if constexpr (ExpInPV) {
+              const float w = valid ? exp2f(static_cast<float>(input_access[index][e])) * probability_scale : 0.0f;
+              const Element h = Element(w);
+              transformed[e] = h;
+              m += static_cast<float>(h); // the mass of what PV consumes
+            } else {
+              transformed[e] = Element(static_cast<float>(input_access[index][e]) * probability_scale);
+            }
           }
           output_access[index] = transformed;
         }
+      }
+      if constexpr (ExpInPV) {
+        acc[s] += m;
+        mass[s] = acc[s];
       }
     }
     // The double-buffered pipeline transforms one final masked look-ahead fragment (all zeros); the clamp keeps its scale
@@ -587,16 +624,20 @@ struct PVTransformA {
   }
 };
 
+using PVTransformA = PVTransformAT<false>;
 using PVTransformB =
     cutlass::NumericArrayConverter<typename PVSmemIteratorB::Element, typename PVIteratorB::Element, PVIteratorB::Fragment::kElements>;
-using PVMma = cutlass::gemm::threadblock::MmaPipelined<typename PVDefaultMma::Shape, PVIteratorA, PVSmemIteratorA, PVIteratorB,
-                                                       PVSmemIteratorB, float, PVLayout, typename PVDefaultMma::Policy,
-                                                       PVTransformA, PVTransformB>;
+template <bool ExpInPV>
+using PVMmaT = cutlass::gemm::threadblock::MmaPipelined<typename PVDefaultMma::Shape, PVIteratorA, PVSmemIteratorA, PVIteratorB,
+                                                        PVSmemIteratorB, float, PVLayout, typename PVDefaultMma::Policy,
+                                                        PVTransformAT<ExpInPV>, PVTransformB>;
+using PVMma = PVMmaT<false>;
 
 union PVSharedStorage {
   typename PVMma::SharedStorage main_loop;
   typename PVEpilogue::SharedStorage epilogue;
 };
+static_assert(sizeof(typename PVMmaT<true>::SharedStorage) == sizeof(typename PVMma::SharedStorage), "one PV workspace");
 
 constexpr int kSplitK = 2;
 
@@ -618,8 +659,10 @@ struct PVParams {
   float const* old_scale;  // [head][rows_pad]
   float const* block_scale;
   bool first;
+  float* mass;  // [TAG_GQA6_EXP_PV] [head][split][rows_pad]: each row's mass over the split's keys
 };
 
+template <bool ExpInPV>
 static __global__ void __launch_bounds__(PVDefault::kThreadCount, 1) gqa6_pv_kernel(const PVParams p) {
   extern __shared__ int4 gqa6_smem_pv[];
   PVSharedStorage& shared = *reinterpret_cast<PVSharedStorage*>(gqa6_smem_pv);
@@ -638,11 +681,38 @@ static __global__ void __launch_bounds__(PVDefault::kThreadCount, 1) gqa6_pv_ker
                                        {tile_m * TBShape::kM, k_begin});
   typename PVMma::IteratorB iterator_B(p.params_B, p.v + head * p.v_head_stride, {k_end, kHeadDim}, thread_idx, {k_begin, 0});
 
-  PVTransformA transform_A(p.tile_scale + head * p.stats_head_stride, p.rows_pad, p.n_tiles, k_begin, tile_m * TBShape::kM);
-  PVMma mma(shared.main_loop, thread_idx, warp_idx, lane_idx, transform_A);
+  using Transform = PVTransformAT<ExpInPV>;
+  constexpr int kS = Transform::kStridedIterations;
+  __shared__ float mass_thread[ExpInPV ? PVDefault::kThreadCount * kS : 1];
+  __shared__ float mass_row[ExpInPV ? TBShape::kM : 1];
+  Transform transform_A(p.tile_scale + head * p.stats_head_stride, p.rows_pad, p.n_tiles, k_begin, tile_m * TBShape::kM, k_end,
+                        mass_thread + thread_idx * kS);
+  if constexpr (ExpInPV) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int s = 0; s < kS; ++s) {
+      mass_thread[thread_idx * kS + s] = 0.0f;
+    }
+    if (thread_idx < TBShape::kM) {
+      mass_row[thread_idx] = 0.0f;
+    }
+  }
+  PVMmaT<ExpInPV> mma(shared.main_loop, thread_idx, warp_idx, lane_idx, transform_A);
   typename PVMma::FragmentC accumulators;
   accumulators.clear();
   mma((k_end - k_begin + TBShape::kK - 1) / TBShape::kK, accumulators, iterator_A, iterator_B, accumulators);
+  if constexpr (ExpInPV) {
+    // [TAG_GQA6_EXP_PV] the row's mass: the threads that share a row add up, then the first threads write the rows out
+    __syncthreads();
+    const auto thread_offset = Transform::ThreadMap::initial_offset(thread_idx);
+    CUTLASS_PRAGMA_UNROLL
+    for (int s = 0; s < kS; ++s) {
+      atomicAdd(&mass_row[thread_offset.strided() + s * Transform::ThreadMap::Delta::kStrided], mass_thread[thread_idx * kS + s]);
+    }
+    __syncthreads();
+    if (thread_idx < TBShape::kM) {
+      p.mass[(int64_t(head) * kSplitK + split) * p.rows_pad + tile_m * TBShape::kM + thread_idx] = mass_row[thread_idx];
+    }
+  }
 
   PVOutputOp output_op(typename PVOutputOp::Params(p.old_scale + head * int64_t(p.rows_pad),
                                                    p.block_scale + head * int64_t(p.rows_pad), p.first));
@@ -698,6 +768,19 @@ static __global__ void gqa6_merge(const float* __restrict__ out, const float* __
   r.z = (a.z + b.z) * inv;
   r.w = (a.w + b.w) * inv;
   *(float4*) ((float*) (dst + (row / kQPerKV) * nb2 + (head * kQPerKV + row % kQPerKV) * nb1) + d) = r;
+}
+
+// [TAG_GQA6_EXP_PV] run_sum += (split 0's mass + split 1's) * block scale, once PV has the block's masses
+static __global__ void gqa6_mass_fold(const float* __restrict__ mass, const float* __restrict__ block_scale,
+                                      float* __restrict__ run_sum, const int rows_pad) {
+  const int row = blockIdx.x * blockDim.x + threadIdx.x;
+  const int head = blockIdx.y;
+  if (row >= rows_pad) {
+    return;
+  }
+  const int64_t i = int64_t(head) * rows_pad + row;
+  const float m = mass[(int64_t(head) * kSplitK + 0) * rows_pad + row] + mass[(int64_t(head) * kSplitK + 1) * rows_pad + row];
+  run_sum[i] += m * block_scale[i];
 }
 
 static bool gqa6_aligned(const ggml_tensor* t) {
@@ -829,6 +912,8 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
   const int chunk_tokens = row_chunk > 0 ? std::min(row_chunk, n_tokens) : n_tokens;
 
   const bool kv_q8 = K->type == GGML_TYPE_Q8_0;
+  // [TAG_GQA6_EXP_PV] LLAMA_FA_GQA6_EXP_PV=1: the exponential and the row sums in the PV GEMM's load instead of the QK epilogue
+  static const bool exp_pv = gqa6_env("LLAMA_FA_GQA6_EXP_PV", 0) != 0;
 
   // the workspace, allocated once for the largest chunk's needs (the full chunk and the last, shorter one) and reused
   size_t q16_size = 0;
@@ -843,7 +928,7 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
     const int block_n = gqa6_block_n(n_heads, rows_pad, n_kv, kv_q8);
     q16_size = std::max(q16_size, size_t(n_heads) * rows_pad * kHeadDim);
     scores_size = std::max(scores_size, size_t(n_heads) * rows_pad * block_n);
-    stats_size = std::max(stats_size, 3 * size_t(n_heads) * (block_n / kTileKeys) * rows_pad + 4 * size_t(n_heads) * rows_pad);
+    stats_size = std::max(stats_size, 3 * size_t(n_heads) * (block_n / kTileKeys) * rows_pad + (4 + kSplitK) * size_t(n_heads) * rows_pad);
     block_n_max = std::max(block_n_max, block_n);
   }
   ggml_cuda_pool_alloc<half> q16(pool, q16_size);
@@ -866,8 +951,10 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
   const int pv_smem = int(sizeof(PVSharedStorage));
   static bool smem_set[GGML_CUDA_MAX_DEVICES] = {false};
   if (!smem_set[id]) {
-    CUDA_CHECK(cudaFuncSetAttribute(gqa6_qk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, qk_smem));
-    CUDA_CHECK(cudaFuncSetAttribute(gqa6_pv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, pv_smem));
+    CUDA_CHECK(cudaFuncSetAttribute(gqa6_qk_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, qk_smem));
+    CUDA_CHECK(cudaFuncSetAttribute(gqa6_qk_kernel<true>,  cudaFuncAttributeMaxDynamicSharedMemorySize, qk_smem));
+    CUDA_CHECK(cudaFuncSetAttribute(gqa6_pv_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, pv_smem));
+    CUDA_CHECK(cudaFuncSetAttribute(gqa6_pv_kernel<true>,  cudaFuncAttributeMaxDynamicSharedMemorySize, pv_smem));
     smem_set[id] = true;
   }
 
@@ -889,6 +976,7 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
     float* run_sum = run_max + size_t(n_heads) * rows_pad;
     float* old_scale = run_sum + size_t(n_heads) * rows_pad;
     float* block_scale = old_scale + size_t(n_heads) * rows_pad;
+    float* mass = block_scale + size_t(n_heads) * rows_pad; // [TAG_GQA6_EXP_PV] [head][split][rows_pad]
 
     {
       const dim3 block(32, 8);
@@ -927,6 +1015,7 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
     pv.out = out.get();
     pv.old_scale = old_scale;
     pv.block_scale = block_scale;
+    pv.mass = mass;
 
     // this chunk's mask rows
     const half* mask_rows = (const half*) ((const char*) mask->data + t0 * mask->nb[1]);
@@ -951,12 +1040,16 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
 
       qk.width = width;
       qk.visitor.mask = mask_rows + begin;
-      gqa6_qk_kernel<<<dim3(rows_pad / TBShape::kM, n_tiles, n_heads), QKDefault::kThreadCount, qk_smem, stream>>>(qk);
+      if (exp_pv) {
+        gqa6_qk_kernel<true><<<dim3(rows_pad / TBShape::kM, n_tiles, n_heads), QKDefault::kThreadCount, qk_smem, stream>>>(qk);
+      } else {
+        gqa6_qk_kernel<false><<<dim3(rows_pad / TBShape::kM, n_tiles, n_heads), QKDefault::kThreadCount, qk_smem, stream>>>(qk);
+      }
       CUDA_CHECK(cudaGetLastError());
 
       gqa6_block_update<<<dim3((rows_pad + 255) / 256, n_heads), 256, 0, stream>>>(
           tile_max, tile_sum, tile_scale, run_max, run_sum, old_scale, block_scale, rows_pad, n_tiles, stats_head_stride,
-          begin == 0);
+          begin == 0, exp_pv);
       CUDA_CHECK(cudaGetLastError());
 
       pv.width = width;
@@ -964,7 +1057,13 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
       pv.n_tiles = n_tiles;
       pv.v = kv_q8 ? (Element*) v16.get() : (Element*) ((char*) V->data + begin * V->nb[1]);
       pv.first = begin == 0;
-      gqa6_pv_kernel<<<dim3(rows_pad / TBShape::kM, 1, n_heads * kSplitK), PVDefault::kThreadCount, pv_smem, stream>>>(pv);
+      if (exp_pv) {
+        gqa6_pv_kernel<true><<<dim3(rows_pad / TBShape::kM, 1, n_heads * kSplitK), PVDefault::kThreadCount, pv_smem, stream>>>(pv);
+        CUDA_CHECK(cudaGetLastError());
+        gqa6_mass_fold<<<dim3((rows_pad + 255) / 256, n_heads), 256, 0, stream>>>(mass, block_scale, run_sum, rows_pad);
+      } else {
+        gqa6_pv_kernel<false><<<dim3(rows_pad / TBShape::kM, 1, n_heads * kSplitK), PVDefault::kThreadCount, pv_smem, stream>>>(pv);
+      }
       CUDA_CHECK(cudaGetLastError());
     }
 
