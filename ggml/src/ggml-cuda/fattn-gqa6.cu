@@ -91,7 +91,7 @@ namespace threadblock {
 
 // 1Cat's EpilogueVisitorSoftmaxV37 with ggml's mask. For each row of a 256-key tile it stores the FP16 probabilities
 // exp(logit - tile max), the FP32 tile max (-inf if every key is masked) and the FP32 sum of the rounded probabilities.
-// [TAG_GQA6_EXP_PV] ExpInPV (LLAMA_FA_GQA6_EXP_PV=1): the row stores (logit - tile max) * log2(e) as FP16 instead of the
+// [TAG_GQA6_EXP_PV] ExpInPV (the default; LLAMA_FA_GQA6_EXP_PV=0 keeps the exponential here): the row stores (logit - tile max) * log2(e) as FP16 instead of the
 // probability, and no sum: the PV GEMM's A transform takes the exponential (one MUFU an element, under its tensor-core loop)
 // and accumulates the row's mass. 1Cat's sm70_79t kernel makes the same move (its QK epilogue stores FP16 logits, PV
 // applies the exponential while it loads) and runs 1.6x faster than the v37 kernel this route came from; ours keeps the
@@ -866,8 +866,9 @@ bool ggml_cuda_fattn_gqa6_applies(const ggml_tensor* dst) {
   }
   static std::atomic<bool> warned[2] = {false, false};
   if (!warned[kv_q8].exchange(true)) {
-    GGML_LOG_WARN("fattn: 6-head prompt attention (LLAMA_FA_GQA6): taken, %s K/V, rows %lld, keys %lld, min rows %d, min keys %d\n",
-                  ggml_type_name(K->type), (long long) Q->ne[1], (long long) K->ne[1], min_rows, min_kv);
+    GGML_LOG_WARN("fattn: 6-head prompt attention (LLAMA_FA_GQA6): taken, %s K/V, rows %lld, keys %lld, min rows %d, min keys %d, exponential in %s\n",
+                  ggml_type_name(K->type), (long long) Q->ne[1], (long long) K->ne[1], min_rows, min_kv,
+                  gqa6_env("LLAMA_FA_GQA6_EXP_PV", 1) != 0 ? "PV" : "the QK epilogue");
   }
   return true;
 }
@@ -912,8 +913,9 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
   const int chunk_tokens = row_chunk > 0 ? std::min(row_chunk, n_tokens) : n_tokens;
 
   const bool kv_q8 = K->type == GGML_TYPE_Q8_0;
-  // [TAG_GQA6_EXP_PV] LLAMA_FA_GQA6_EXP_PV=1: the exponential and the row sums in the PV GEMM's load instead of the QK epilogue
-  static const bool exp_pv = gqa6_env("LLAMA_FA_GQA6_EXP_PV", 0) != 0;
+  // [TAG_GQA6_EXP_PV] the exponential and the row sums in the PV GEMM's load instead of the QK epilogue (CHANGES.md section
+  // 25; LLAMA_FA_GQA6_EXP_PV=0 puts them back in the epilogue)
+  static const bool exp_pv = gqa6_env("LLAMA_FA_GQA6_EXP_PV", 1) != 0;
 
   // the workspace, allocated once for the largest chunk's needs (the full chunk and the last, shorter one) and reused
   size_t q16_size = 0;

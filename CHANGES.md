@@ -569,9 +569,9 @@ BetterBench, same day, same launcher (aggregate decode, 1 / 2 / 4 requests; time
 | Section 23 | 89.8 / 102.5 / 137.4 tok/s | 0.33 / 0.57 s |
 | This one | 90.9 / 117.7 / 156.3 tok/s | 0.31 / 0.37 s |
 
-## 25. Two ideas from 1Cat-vLLM, measured: lookup drafting and the exponential in PV (branch 1cat-merge)
+## 25. Two ideas from 1Cat-vLLM, measured: lookup drafting and the exponential in PV
 
-Both are off by default; each has a switch, and neither earned its place.
+Measured on the branch 1cat-merge, then merged: the exponential in PV is on by default, lookup drafting stays off.
 
 - **Lookup drafting beside DFlash2** (`LLAMA_SPEC_LOOKUP=1`, `TAG_SPEC_LOOKUP`; after 1Cat's lookup-augmented block
   drafting, itself from syv-ai/HyperQwen). After the draft, the request's own tokens are scanned backwards for the most
@@ -585,7 +585,7 @@ Both are off by default; each has a switch, and neither earned its place.
   probability for its token, where a calibrated row that agrees with the target is accepted with probability ~1. The
   extra rows cost verify time and add no accepted tokens. HyperQwen's +47% on copies was measured greedy, where a
   one-token row is exact.
-- **The exponential in PV** (`LLAMA_FA_GQA6_EXP_PV=1`, `TAG_GQA6_EXP_PV`; after 1Cat's sm70_79t prefill kernel, which
+- **The exponential in PV** (`TAG_GQA6_EXP_PV`, on by default, `LLAMA_FA_GQA6_EXP_PV=0` puts it back in the epilogue; after 1Cat's sm70_79t prefill kernel, which
   stores FP16 logits in its QK epilogue and applies the exponential as PV loads). The QK epilogue stores
   (logit - tile max) * log2(e) as FP16 and no sum; PV's A transform takes exp2 and accumulates each row's mass, folded
   into the running sum after PV. 152 attention cases pass. Prompt attention on the Q8_0 cache: +1.2% at 1,024 and
@@ -604,8 +604,7 @@ BetterBench (temperature 1.0, the production launcher), against the section 24 b
 The exponential in PV lands inside the run-to-run spread of the reference (its three same-day runs gave 102.5 to
 104.4 weighted; the 2-request column moves 10% between runs of the same build). Lookup drafting fired on 3% of the
 drafting rounds (962 of 32,734, 3,753 tokens proposed, nearly all strong matches) and cost 1 to 5% at 1 and 2 requests,
-as the copy probe predicted: the proposed rows are verified and mostly rejected. Nothing here moves the production
-build; the branch stays as a record, both switches off.
+as the copy probe predicted: the proposed rows are verified and mostly rejected.
 
 At depth (`deepctx.py`: one conversation whose first turn is a 199,736-token synthetic code base, then copy / rename /
 prose turns at that depth, two cycles of the four configurations, temperature 1.0):
@@ -623,3 +622,7 @@ nothing on decode. Lookup drafting fires on 79% of the rounds of a copy at this 
 copied sits in the prompt) and loses a third of the decode speed: it drafts the full 7 rows every round where DFlash2
 drafts about 5 and stops where its confidence drops, the accepted count per round comes out the same, and at 200k keys
 each verified row is paid in attention. Lookup's 200k-token backward scan per round is not what costs; the rows are.
+
+Adopted: the exponential in PV is the default (0.5% on a 200k-token prefill, inside the noise elsewhere, 152 attention
+cases exact), and the server's first 6-head prompt attention line names where the exponential runs. Lookup drafting
+stays in the tree as an opt-in switch, for a greedy or a calibrated-row experiment; it is not forwarded by default.
