@@ -568,3 +568,41 @@ BetterBench, same day, same launcher (aggregate decode, 1 / 2 / 4 requests; time
 | Section 21 | 91.3 / 111.8 / 158.3 tok/s | 0.31 / 0.37 s |
 | Section 23 | 89.8 / 102.5 / 137.4 tok/s | 0.33 / 0.57 s |
 | This one | 90.9 / 117.7 / 156.3 tok/s | 0.31 / 0.37 s |
+
+## 25. Two ideas from 1Cat-vLLM, measured: lookup drafting and the exponential in PV (branch 1cat-merge)
+
+Both are off by default; each has a switch, and neither earned its place.
+
+- **Lookup drafting beside DFlash2** (`LLAMA_SPEC_LOOKUP=1`, `TAG_SPEC_LOOKUP`; after 1Cat's lookup-augmented block
+  drafting, itself from syv-ai/HyperQwen). After the draft, the request's own tokens are scanned backwards for the most
+  recent earlier occurrence of their last 6 to 12 tokens. A strong match (8 or more) proposes what followed it: the
+  drafter's rows that agree stay, the continuation takes over from the first disagreement or past the drafter's last
+  token, up to the drafter's width (`LLAMA_SPEC_LOOKUP_WIDE` can ask for more when the slot generates alone, within its
+  rollback depth, which caps it at 7 here). A replaced position carries a one-token draft distribution, so the rejection
+  and block steps keep the target's output distribution. On a verbatim copy of a 1.6k-token file at temperature 1.0
+  (`copy_probe.py`): DFlash2 alone 158 tok/s at 82% acceptance; with lookup 145 tok/s at 72%. DFlash2 stops drafting
+  where its confidence drops, the lookup fills those rows, and a one-token row is accepted only with the target's
+  probability for its token, where a calibrated row that agrees with the target is accepted with probability ~1. The
+  extra rows cost verify time and add no accepted tokens. HyperQwen's +47% on copies was measured greedy, where a
+  one-token row is exact.
+- **The exponential in PV** (`LLAMA_FA_GQA6_EXP_PV=1`, `TAG_GQA6_EXP_PV`; after 1Cat's sm70_79t prefill kernel, which
+  stores FP16 logits in its QK epilogue and applies the exponential as PV loads). The QK epilogue stores
+  (logit - tile max) * log2(e) as FP16 and no sum; PV's A transform takes exp2 and accumulates each row's mass, folded
+  into the running sum after PV. 152 attention cases pass. Prompt attention on the Q8_0 cache: +1.2% at 1,024 and
+  2,048-token appends (41.4 -> 41.9 TFLOPS at 168k keys), -2.5% at 17 tokens. The epilogue's exponential and sum were
+  not the limit of the QK kernel.
+
+BetterBench (temperature 1.0, the production launcher), against the section 24 build the same day:
+
+| build | weighted decode | aggregate t/s at 1 / 2 / 4 requests | TTFT p50 (1 / 2 / 4) | acceptance |
+|---|--:|--:|--:|--:|
+| section 24 build (reference, rsT run; rsW ran only the concurrency part) | 102.7 | 91.3 / 111.8 / 158.3 (rsW: 90.9 / 117.7 / 156.3) | 0.19 / 0.31 / 0.37 s | 46.7% |
+| exponential in PV | 104.3 | 91.5 / 122.3 / 155.3 | 0.19 / 0.30 / 0.37 s | 47.5% |
+| lookup drafting | 101.4 | 88.1 / 106.0 / 154.3 | 0.19 / 0.31 / 0.37 s | 46.4% |
+| both | 103.0 | 89.5 / 118.7 / 153.8 | 0.19 / 0.30 / 0.37 s | 46.4% |
+
+The exponential in PV lands inside the run-to-run spread of the reference (its three same-day runs gave 102.5 to
+104.4 weighted; the 2-request column moves 10% between runs of the same build). Lookup drafting fired on 3% of the
+drafting rounds (962 of 32,734, 3,753 tokens proposed, nearly all strong matches) and cost 1 to 5% at 1 and 2 requests,
+as the copy probe predicted: the proposed rows are verified and mostly rejected. Nothing here moves the production
+build; the branch stays as a record, both switches off.
