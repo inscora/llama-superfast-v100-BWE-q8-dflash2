@@ -4281,22 +4281,20 @@ private:
         auto & q     = slot.spec_q;
         const bool with_q = !draft.empty() && q.size() == draft.size();
 
+        // the drafter's rows that agree with the continuation stay (their distribution accepts a token the target also
+        // favours with probability ~1, a one-token row only with the target's probability for it): the continuation takes
+        // over from the first disagreement, or past the drafter's last token. A weak match only fills past that end
         int32_t keep = 0;
-        if (strong) {
-            if (width < 1) {
+        while (keep < (int32_t) draft.size() && keep < width && draft[keep] == tok(best_j + 1 + keep)) {
+            ++keep;
+        }
+        if (!strong) {
+            if (keep < (int32_t) draft.size() || keep < agree) {
                 return;
             }
-        } else {
-            // the drafter must have proposed the same first tokens
-            if ((int32_t) draft.size() < agree || width <= agree) {
-                return;
-            }
-            for (int32_t i = 0; i < agree; ++i) {
-                if (draft[i] != tok(best_j + 1 + i)) {
-                    return;
-                }
-            }
-            keep = agree;
+        }
+        if (keep >= width) {
+            return; // nothing to add
         }
         draft.resize(width);
         if (with_q || draft.empty()) {
