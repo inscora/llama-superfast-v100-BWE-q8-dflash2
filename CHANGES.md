@@ -606,3 +606,20 @@ The exponential in PV lands inside the run-to-run spread of the reference (its t
 drafting rounds (962 of 32,734, 3,753 tokens proposed, nearly all strong matches) and cost 1 to 5% at 1 and 2 requests,
 as the copy probe predicted: the proposed rows are verified and mostly rejected. Nothing here moves the production
 build; the branch stays as a record, both switches off.
+
+At depth (`deepctx.py`: one conversation whose first turn is a 199,736-token synthetic code base, then copy / rename /
+prose turns at that depth, two cycles of the four configurations, temperature 1.0):
+
+| build | cold prefill of 200k tokens | copy at 200k (decode t/s, acceptance) | rename at 200k | prose at 200k |
+|---|--:|--:|--:|--:|
+| switches off | 393.7 / 395.6 s (505-507 tok/s) | 94-104, 73-79% | 107-110, 82-85% | 44-56, 26-36% |
+| exponential in PV | 392.3 / 392.6 s (509 tok/s) | 99-105, 76-79% | 105-111, 81-86% | 43-56, 25-36% |
+| lookup drafting | 396.0 / 396.2 s (504 tok/s) | 66-68, 46% | 69-71, 48-50% | 44-47, 25-28% |
+| both | 392.6 / 393.2 s (508 tok/s) | 65-68, 45-46% | 68-71, 47-49% | 43-63, 24-43% |
+
+A follow-up turn prefills only its own ~50 tokens (the reply before it is already in the cache); that pass takes
+0.45-0.53 s in every configuration. The exponential in PV is 0.5% on the cold prefill, four runs against four, and
+nothing on decode. Lookup drafting fires on 79% of the rounds of a copy at this depth (98 of 124, the module being
+copied sits in the prompt) and loses a third of the decode speed: it drafts the full 7 rows every round where DFlash2
+drafts about 5 and stops where its confidence drops, the accepted count per round comes out the same, and at 200k keys
+each verified row is paid in attention. Lookup's 200k-token backward scan per round is not what costs; the rows are.
