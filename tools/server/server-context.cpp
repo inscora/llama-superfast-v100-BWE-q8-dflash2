@@ -5702,11 +5702,28 @@ private:
                     server_slot & slot = *tu_job.slot;
                     llama_decode_job_info info = {};
                     llama_decode_job_get_info(ctx_tgt, &info);
-                    LOG_WRN("TU job: slot %d cancelled after %d groups\n", slot.id, info.n_groups);
-                    // the cache holds the ubatches that completed, the slot's tokens the whole batch: the slot starts over
+                    // [TAG_TU_CANCEL_KEEP] the cache holds the ubatches that completed, the slot's tokens the whole batch, and
+                    // the drafter saw none of it: the slot keeps the tokens before this job's batch. Its next launch meets the
+                    // same state as after a shortened prompt (the recurrent state and the cells past the kept tokens): it
+                    // restores the checkpoint below them and re-reads from there. Clearing the slot instead cost a 166k-token
+                    // conversation its whole prefill when a client cancel landed 3 s into a follow-up
+                    const int32_t n_keep = std::max<int32_t>(0, slot.prompt.n_tokens() - (int32_t) batch_tu.size());
+                    LOG_WRN("TU job: slot %d cancelled after %d groups, %d of %d tokens in the cache; the slot keeps %d tokens\n",
+                            slot.id, info.n_groups, info.n_tokens_done, info.n_tokens, n_keep);
                     slot.tu_owned = false;
                     slot.release();
-                    slot.prompt_clear();
+                    if (n_keep > 0) {
+                        slot.prompt.tokens.keep_first(n_keep);
+                        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                            if (it->n_tokens > n_keep) {
+                                it = slot.prompt.checkpoints.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                    } else {
+                        slot.prompt_clear();
+                    }
                     tu_job.active = false;
                     batch_tu.clear();
                 } break;

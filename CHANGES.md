@@ -627,3 +627,17 @@ Adopted: the exponential in PV is the default (0.5% on a 200k-token prefill, ins
 cases exact). The route's one-time log line names where the exponential runs, though the server does not surface that
 line (it never has; the route is live: LLAMA_FA_GQA6_Q8=0 costs 1-3% of prefill at 16k-40k tokens). Lookup drafting
 stays in the tree as an opt-in switch, for a greedy or a calibrated-row experiment.
+
+## 26. A cancelled prompt job keeps the conversation
+
+A client cancel that lands inside a two-user prompt job (a 2048-token group takes 1-5 s at depth, so most cancels of a
+follow-up on a long conversation do) ended with the slot cleared: "the slot starts over". In production on 2026-11-02
+that dropped a 166k-token conversation 3 s into a follow-up; the retry one second later found no slot to match, began
+the 173k-token prompt from zero and was cancelled again at 15%; the next morning's query finished it in 289 s.
+
+Now (`TAG_TU_CANCEL_KEEP`) the slot keeps the tokens before the job's batch, the cache keeps the ubatches that
+completed (the context ends a cancelled job at a ubatch boundary) and the drafter's state, which never saw the batch,
+matches the kept tokens. The next launch meets the same state as after a shortened prompt: the recurrent state sits
+past the kept tokens, so it restores the checkpoint below them and re-reads from there, then removes the cells past the
+prompt. A cancel costs the distance from the last checkpoint, not the conversation. The log line names the kept count:
+`TU job: slot N cancelled after G groups, D of T tokens in the cache; the slot keeps K tokens`.
