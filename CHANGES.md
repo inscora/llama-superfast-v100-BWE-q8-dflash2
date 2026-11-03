@@ -641,3 +641,8 @@ matches the kept tokens. The next launch meets the same state as after a shorten
 past the kept tokens, so it restores the checkpoint below them and re-reads from there, then removes the cells past the
 prompt. A cancel costs the distance from the last checkpoint, not the conversation. The log line names the kept count:
 `TU job: slot N cancelled after G groups, D of T tokens in the cache; the slot keeps K tokens`.
+
+Probe (`cancel_probe.py`: a 41k-token conversation, then an 8k-token follow-up cancelled 1.5 s and 4 s in, each re-sent):
+before, the retry read 51,719 and 62,106 tokens (the conversation gone each time); now 10,348 both times, the follow-up
+plus the re-read from the last checkpoint, with the cancelled job's 2,048 cached tokens discarded as the state past
+the kept prefix.
