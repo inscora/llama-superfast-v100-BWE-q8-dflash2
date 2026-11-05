@@ -2366,6 +2366,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         // [TAG_QPN_GEMM] the fused kernel reads the repacked weight itself; the expansion node was left unwritten for a
         // weight it decodes (GGML_OP_CPY below), so a product it does not take expands that weight now, into the node
         const ggml_tensor * w = src0->src[0];
+        if (ggml_cuda_qpn_gemm_check_on()) { // once per weight shape: whether the fused kernel takes this product, and why not
+            static std::mutex mu; static std::set<std::tuple<int, int64_t, int64_t, int64_t>> seen;
+            std::lock_guard<std::mutex> lock(mu);
+            if (seen.insert(std::make_tuple((int) w->type, w->ne[0], w->ne[1], ggml_nrows(src1))).second) {
+                GGML_LOG_WARN("qpn gemm: %s %" PRId64 " x %" PRId64 " at %" PRId64 " tokens: on=%d repacked=%d view=%d type=%d flat=%d/%d src1=[%" PRId64 ",%" PRId64 ",%" PRId64 "] nb0=%zu/%zu takes=%d
+",
+                              ggml_type_name(w->type), w->ne[1], w->ne[0], ggml_nrows(src1), (int) ggml_cuda_qpn_gemm_on(), (int) ggml_cuda_qpn_is_repacked(w),
+                              (int) (w->view_src != nullptr), (int) ggml_cuda_qpn_gemm_type(w->type), (int) ggml_cuda_qpn_flat_cols(src1), (int) ggml_cuda_qpn_flat_cols(dst),
+                              src1->ne[0], src1->ne[1], src1->ne[2], src1->nb[0], dst->nb[0], (int) ggml_cuda_qpn_gemm_takes(w, src1, dst));
+            }
+        }
         if (ggml_cuda_qpn_gemm_takes(w, src1, dst)) {
             ggml_cuda_mul_mat_qpn_gemm(ctx, w, src1, dst);
             if (!ggml_cuda_qpn_gemm_check_on()) {
