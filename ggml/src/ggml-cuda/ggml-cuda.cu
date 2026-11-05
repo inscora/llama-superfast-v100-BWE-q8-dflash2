@@ -81,7 +81,7 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/qsa-select.cuh"
 #include "ggml-cuda/qsa-union.cuh"
-#include "qpn-gemm.cuh"
+#include "ggml-cuda/qpn-gemm.cuh"
 #include "ggml.h"
 
 #include <algorithm>
