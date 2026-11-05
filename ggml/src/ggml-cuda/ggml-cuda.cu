@@ -81,6 +81,7 @@
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/qsa-select.cuh"
 #include "ggml-cuda/qsa-union.cuh"
+#include "qpn-gemm.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2362,6 +2363,25 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // (tokens over several sequences, [K, tokens, sequences] with its rows one run, are columns too)
     if (ggml_cuda_qpn_is_expansion(src0)) { // the fallback's cuBLAS call below, on the expansion node's fp16 weight
         GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        // [TAG_QPN_GEMM] the fused kernel reads the repacked weight itself; the expansion node was left unwritten for a
+        // weight it decodes (GGML_OP_CPY below), so a product it does not take expands that weight now, into the node
+        const ggml_tensor * w = src0->src[0];
+        if (ggml_cuda_qpn_gemm_takes(w, src1, dst)) {
+            ggml_cuda_mul_mat_qpn_gemm(ctx, w, src1, dst);
+            if (!ggml_cuda_qpn_gemm_check_on()) {
+                return;
+            }
+            ggml_cuda_pool_alloc<float> ref(ctx.pool(), ggml_nelements(dst));
+            ggml_tensor dst_ref = *dst;
+            dst_ref.data = ref.get();
+            ggml_cuda_qpn_to_fp16(w, (half *) src0->data, ctx.stream());
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, &dst_ref);
+            ggml_cuda_qpn_gemm_compare(w, src1, (const float *) dst->data, ref.get(), ctx.stream());
+            return;
+        }
+        if (ggml_cuda_qpn_gemm_on() && ggml_cuda_qpn_gemm_type(w->type)) {
+            ggml_cuda_qpn_to_fp16(w, (half *) src0->data, ctx.stream());
+        }
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
@@ -2806,6 +2826,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_CPY:
             if (ggml_cuda_qpn_is_expansion(dst)) { // the kernel ggml_cuda_mul_mat's fallback runs, into the node
                 GGML_ASSERT(ggml_are_same_shape(dst, dst->src[0]) && ggml_is_contiguous(dst));
+                // [TAG_QPN_GEMM] a weight the fused kernel decodes is read repacked; its product expands it here on demand
+                if (ggml_cuda_qpn_gemm_on() && ggml_cuda_qpn_gemm_type(dst->src[0]->type)) {
+                    break;
+                }
                 ggml_cuda_qpn_to_fp16(dst->src[0], (half *) dst->data, ctx.stream());
                 break;
             }
