@@ -12729,7 +12729,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // a deep conversation's prompt append on the Q8_0 cache (the 6-head route): short appends (TAG_GQA6_KV_BUDGET), a
     // micro-batch and its 1,024-token chunk at 32k, 96k and 168k keys
     for (int64_t kv : {32768, 98304, 172032}) {
-        for (int64_t nb : {17, 32, 128, 1024, 2048}) {
+        for (int64_t nb : {17, 32, 64, 128, 1024, 2048}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
                                                             GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
         }
