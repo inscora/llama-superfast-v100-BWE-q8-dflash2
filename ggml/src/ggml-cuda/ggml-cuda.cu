@@ -2418,6 +2418,42 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             src0_q.flags &= ~GGML_TENSOR_FLAG_BACKEND_LAYOUT;
             ggml_cuda_mul_mat_q(ctx, &src0_q, src1, nullptr, dst);
         } else {
+            // [TAG_QPN_GEMM] LLAMA_QPN_GEMM=1: the fused kernel reads the repacked weight, no expansion (qpn-gemm.cu);
+            // LLAMA_QPN_GEMM_CHECK=1 runs the expansion and cuBLAS as well and logs the largest difference per shape
+            if (ggml_cuda_qpn_gemm_check_on()) {
+                static std::mutex mu; static std::set<std::tuple<int, int64_t, int64_t, int64_t>> seen;
+                std::lock_guard<std::mutex> lock(mu);
+                if (seen.insert(std::make_tuple((int) src0->type, src0->ne[0], src0->ne[1], ggml_nrows(src1))).second) {
+                    GGML_LOG_WARN("qpn gemm: %s %" PRId64 " x %" PRId64 " at %" PRId64 " tokens: on=%d type=%d flat=%d/%d src1=[%" PRId64 ",%" PRId64 ",%" PRId64 "] takes=%d
+",
+                                  ggml_type_name(src0->type), src0->ne[1], src0->ne[0], ggml_nrows(src1), (int) ggml_cuda_qpn_gemm_on(),
+                                  (int) ggml_cuda_qpn_gemm_type(src0->type), (int) ggml_cuda_qpn_flat_cols(src1), (int) ggml_cuda_qpn_flat_cols(dst),
+                                  src1->ne[0], src1->ne[1], src1->ne[2], (int) ggml_cuda_qpn_gemm_takes(src0, src1, dst));
+                }
+            }
+            if (ggml_cuda_qpn_gemm_takes(src0, src1, dst)) {
+                ggml_cuda_mul_mat_qpn_gemm(ctx, src0, src1, dst);
+                if (!ggml_cuda_qpn_gemm_check_on()) {
+                    return;
+                }
+                ggml_cuda_pool_alloc<float> ref(ctx.pool(), ggml_nelements(dst));
+                ggml_cuda_pool_alloc<half> w16c(ctx.pool(), ggml_nelements(src0));
+                ggml_cuda_qpn_to_fp16(src0, w16c.get(), ctx.stream());
+                ggml_tensor src0_c = *src0;
+                src0_c.type     = GGML_TYPE_F16;
+                src0_c.data     = w16c.get();
+                src0_c.flags   &= ~GGML_TENSOR_FLAG_BACKEND_LAYOUT;
+                src0_c.view_src = nullptr;
+                src0_c.nb[0]    = sizeof(half);
+                for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                    src0_c.nb[i] = src0_c.nb[i - 1]*src0_c.ne[i - 1];
+                }
+                ggml_tensor dst_ref = *dst;
+                dst_ref.data = ref.get();
+                ggml_cuda_mul_mat_cublas(ctx, &src0_c, src1, &dst_ref);
+                ggml_cuda_qpn_gemm_compare(src0, src1, (const float *) dst->data, ref.get(), ctx.stream());
+                return;
+            }
             const bool check = ggml_cuda_qpn_check_enabled();
             ggml_cuda_pool_alloc<half> w16(ctx.pool(), ggml_nelements(src0)*(check ? 2 : 1));
             ggml_cuda_qpn_to_fp16(src0, w16.get(), ctx.stream(), check ? w16.get() + ggml_nelements(src0) : nullptr);
