@@ -58,19 +58,60 @@ static_assert(ThreadMapB::kElementsPerAccess == 8, "one chunk word per access");
 static_assert(ThreadMapB::Iterations::kContiguous == 1, "a thread's accesses share their 8 K columns");
 static_assert(TBShape::kK % 8 == 0 && 32 % TBShape::kK == 0 || TBShape::kK % 32 == 0, "whole chunk words");
 
-// the 8 values of columns 8q..8q+7 of sub-block j (columns 32j..32j+31 of the superblock) of row r, decoded as
-// qpn_to_fp16_fast_kernel decodes them (the same float operations, the same rounding to fp16)
+// The raw words one access needs: the code word, its high-bit word (Q5_K, Q6_K), the row's header (Q4_K/Q5_K: d, dmin,
+// scales; Q6_K: the 16 scales; IQ4_XS: the tail with d and the scales), an extra word (Q6_K: d) and the position
+// (sub-block j, word q). The iterator only loads them (the pipeline issues these loads a k-step ahead); the transform
+// decodes them when the fragment is stored to shared memory, after the current tile's MMAs, as CUTLASS's own operand
+// transform runs. Decoding inside load() instead stalled every k-step on the loads: 610 against 900 tok/s
+constexpr int kRawWords = 8;
+
 template <ggml_type type>
-static __device__ __forceinline__ void qpn_gemm_decode8(const char* __restrict__ tsb, const int r, const int j, const int q,
-                                                        cutlass::half_t* out) {
-  float v[8];
+static __device__ __forceinline__ void qpn_gemm_load_raw(const char* __restrict__ tsb, const int r, const int j, const int q,
+                                                         const uint4& header, uint32_t* raw) {
   if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
     constexpr int ch0 = type == GGML_TYPE_Q4_K ? 1 : 3;
-    const uint4 hd = *(const uint4*) (tsb + r * 16);  // d, dmin, scales
-    const uint32_t cw = *(const uint32_t*) (tsb + (ch0 + j) * QPN_CHUNK + r * 16 + 4 * q);
+    raw[0] = *(const uint32_t*) (tsb + (ch0 + j) * QPN_CHUNK + r * 16 + 4 * q);
+    raw[1] = type == GGML_TYPE_Q5_K ? *(const uint32_t*) (tsb + (1 + j / 4) * QPN_CHUNK + r * 16 + 4 * (j % 4)) : 0u;
+    raw[6] = 0u;
+  } else if constexpr (type == GGML_TYPE_Q6_K) {
+    raw[0] = *(const uint32_t*) (tsb + j * QPN_CHUNK + r * 16 + 4 * q);
+    raw[1] = *(const uint32_t*) (tsb + (8 + j / 2) * QPN_CHUNK + r * 16 + 4 * ((2 * j) % 4) + (q < 2 ? 0 : 4));
+    raw[6] = (uint32_t) (uint16_t) qpn_load_tail<type>(tsb, r).x;  // d
+  } else if constexpr (type == GGML_TYPE_IQ4_XS) {
+    raw[0] = *(const uint32_t*) (tsb + j * QPN_CHUNK + r * 16 + 4 * q);
+    raw[1] = 0u;
+    raw[6] = 0u;
+  }
+  raw[2] = header.x;
+  raw[3] = header.y;
+  raw[4] = header.z;
+  raw[5] = header.w;
+  raw[7] = (uint32_t) j | ((uint32_t) q << 8);
+}
+
+// the row's per-superblock header as the raw words carry it
+template <ggml_type type>
+static __device__ __forceinline__ uint4 qpn_gemm_header(const char* __restrict__ tsb, const int r) {
+  if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
+    return *(const uint4*) (tsb + r * 16);  // d, dmin, scales
+  } else if constexpr (type == GGML_TYPE_Q6_K) {
+    return *(const uint4*) (tsb + 12 * QPN_CHUNK + r * 16);  // the 16 scales
+  } else {
+    return qpn_load_tail<type>(tsb, r);  // d, scales_h, scales_l
+  }
+}
+
+// the 8 values of columns 8q..8q+7 of sub-block j, decoded as qpn_to_fp16_fast_kernel decodes them (the same float
+// operations, the same rounding to fp16)
+template <ggml_type type>
+static __device__ __forceinline__ void qpn_gemm_decode8(const uint32_t* raw, cutlass::half_t* out) {
+  const int j = (int) (raw[7] & 0xFF), q = (int) (raw[7] >> 8);
+  const uint32_t cw = raw[0];
+  float v[8];
+  if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
     half2 dm;
-    memcpy(&dm, &hd.x, 4);
-    const uint32_t sw[3] = {hd.y, hd.z, hd.w};
+    memcpy(&dm, &raw[2], 4);
+    const uint32_t sw[3] = {raw[3], raw[4], raw[5]};
     const float dall = __low2half(dm);
     const float dmin = __high2half(dm);
     uint8_t sc, m;
@@ -78,7 +119,7 @@ static __device__ __forceinline__ void qpn_gemm_decode8(const char* __restrict__
     const float d = dall * sc;
     const float mm = dmin * m;
     if constexpr (type == GGML_TYPE_Q5_K) {
-      const uint32_t hw = *(const uint32_t*) (tsb + (1 + j / 4) * QPN_CHUNK + r * 16 + 4 * (j % 4));  // w[4 + j]
+      const uint32_t hw = raw[1];
 #pragma unroll
       for (int s = 0; s < 8; ++s) {
         const int code = ((cw >> (4 * qpn_nib(s))) & 0xF) + ((hw >> qpn_hb5(q, s)) & 1 ? 16 : 0);
@@ -91,13 +132,9 @@ static __device__ __forceinline__ void qpn_gemm_decode8(const char* __restrict__
       }
     }
   } else if constexpr (type == GGML_TYPE_Q6_K) {
-    const uint32_t cw = *(const uint32_t*) (tsb + j * QPN_CHUNK + r * 16 + 4 * q);
-    // w[32 + 2j] holds the high bits of words 0,1 of sub-block j and w[33 + 2j] those of words 2,3
-    const uint32_t h = *(const uint32_t*) (tsb + (8 + j / 2) * QPN_CHUNK + r * 16 + 4 * ((2 * j) % 4) + (q < 2 ? 0 : 4));
-    const uint4 sv = *(const uint4*) (tsb + 12 * QPN_CHUNK + r * 16);  // the 16 scales
-    const int8_t* scales = (const int8_t*) &sv;
-    const uint16_t dh = (uint16_t) qpn_load_tail<type>(tsb, r).x;
-    const float d = __ushort_as_half(dh);
+    const uint32_t h = raw[1];
+    const int8_t* scales = (const int8_t*) (raw + 2);
+    const float d = __ushort_as_half((uint16_t) raw[6]);
     const int ip = j / 4, q4 = j % 4;
     const int8_t sc = scales[8 * ip + q / 2 + 2 * q4];  // l/16 == q/2 for l = 8q + s
 #pragma unroll
@@ -106,10 +143,8 @@ static __device__ __forceinline__ void qpn_gemm_decode8(const char* __restrict__
       v[s] = d * sc * ((int8_t) c - 32);
     }
   } else if constexpr (type == GGML_TYPE_IQ4_XS) {
-    const uint32_t cw = *(const uint32_t*) (tsb + j * QPN_CHUNK + r * 16 + 4 * q);
-    const uint4 tl = qpn_load_tail<type>(tsb, r);
     block_iq4_xs b;
-    memcpy(&b, &tl, 8);  // d, scales_h, scales_l
+    memcpy(&b, raw + 2, 8);  // d, scales_h, scales_l
     const float d = (float) b.d * ((((b.scales_l[j / 2] >> 4 * (j % 2)) & 0xf) | (((b.scales_h >> 2 * j) & 3) << 4)) - 32);
 #pragma unroll
     for (int s = 0; s < 8; ++s) {
@@ -125,12 +160,13 @@ static __device__ __forceinline__ void qpn_gemm_decode8(const char* __restrict__
 
 // The B operand iterator over a repacked weight of N rows and K = 256*nsb columns: the interface MmaPipelined uses
 // (load, ++, clear_mask), the thread map of the GEMM's own B iterator, and its fragment order (strided iterations, then
-// the 8 elements of the access), so SmemIteratorB stores the fragment as it stores the predicated iterator's
+// the access), so the transform's output is stored as the predicated iterator's fragment would be. The fragment holds
+// the raw words; the row headers are kept per row and reloaded when the superblock changes
 template <ggml_type type>
 struct QpnIteratorB {
-  using Element = cutlass::half_t;
+  using Element = uint32_t;
   using ThreadMap = ThreadMapB;
-  using Fragment = cutlass::Array<Element, ThreadMap::Iterations::kCount * ThreadMap::kElementsPerAccess>;
+  using Fragment = cutlass::Array<uint32_t, ThreadMap::Iterations::kStrided * kRawWords>;
   static constexpr int kTSB = qpn_tsb<type>();
 
   struct Params {
@@ -143,11 +179,13 @@ struct QpnIteratorB {
   int nsb_;
   int n_;
   int k_;                                        // first K column of this thread's accesses
+  int sb_;                                       // the superblock the headers belong to
   int row_[ThreadMap::Iterations::kStrided];     // the rows of this thread's accesses
+  uint4 header_[ThreadMap::Iterations::kStrided];
   bool masked_;
 
   CUTLASS_DEVICE QpnIteratorB(const Params& p, int thread_idx, int k0, int n0)
-      : w_(p.w), nsb_(p.nsb), n_(p.n), masked_(false) {
+      : w_(p.w), nsb_(p.nsb), n_(p.n), sb_(-1), masked_(false) {
     const auto offset = ThreadMap::initial_offset(thread_idx);
     k_ = k0 + offset.contiguous();
     CUTLASS_PRAGMA_UNROLL
@@ -157,22 +195,31 @@ struct QpnIteratorB {
   }
 
   CUTLASS_DEVICE void load(Fragment& frag) {
-    Element* out = frag.data();
+    uint32_t* out = frag.data();
     const int sb = k_ / QK_K;
     const int j = (k_ % QK_K) / 32;
     const int q = (k_ % 32) / 8;
+    if (!masked_ && sb != sb_) {
+      sb_ = sb;
+      CUTLASS_PRAGMA_UNROLL
+      for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
+        const int row = row_[s];
+        header_[s] = row < n_ ? qpn_gemm_header<type>(w_ + ((int64_t) (row / 32) * nsb_ + sb) * kTSB, row % 32) : make_uint4(0, 0, 0, 0);
+      }
+    }
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
       const int row = row_[s];
+      uint32_t* raw = out + s * kRawWords;
       if (masked_ || row >= n_) {
         CUTLASS_PRAGMA_UNROLL
-        for (int e = 0; e < 8; ++e) {
-          out[s * 8 + e] = Element(0);
+        for (int e = 0; e < kRawWords; ++e) {
+          raw[e] = 0u;
         }
         continue;
       }
       const char* tsb = w_ + ((int64_t) (row / 32) * nsb_ + sb) * kTSB;
-      qpn_gemm_decode8<type>(tsb, row % 32, j, q, out + s * 8);
+      qpn_gemm_load_raw<type>(tsb, row % 32, j, q, header_[s], raw);
     }
   }
 
@@ -186,9 +233,28 @@ struct QpnIteratorB {
   }
 };
 
+// the raw words of a fragment decoded to the fp16 fragment the shared-memory iterator stores (a masked access's words
+// are zero: header zero, code zero, so its values are zero as the padded rows of the predicated iterator would be)
+template <ggml_type type>
+struct QpnTransformB {
+  using InputFragment = typename QpnIteratorB<type>::Fragment;
+  using OutputFragment = cutlass::Array<cutlass::half_t, ThreadMapB::Iterations::kStrided * 8>;
+  CUTLASS_DEVICE OutputFragment operator()(const InputFragment& in) const {
+    OutputFragment out;
+    CUTLASS_PRAGMA_UNROLL
+    for (int s = 0; s < ThreadMapB::Iterations::kStrided; ++s) {
+      qpn_gemm_decode8<type>(in.data() + s * kRawWords, out.data() + s * 8);
+    }
+    return out;
+  }
+};
+
+using TransformA = cutlass::NumericArrayConverter<cutlass::half_t, cutlass::half_t, IteratorA::Fragment::kElements>;
+
 template <ggml_type type>
 using Mma = cutlass::gemm::threadblock::MmaPipelined<typename DefaultMma::Shape, IteratorA, SmemIteratorA, QpnIteratorB<type>,
-                                                     SmemIteratorB, float, LayoutC, typename DefaultMma::Policy>;
+                                                     SmemIteratorB, float, LayoutC, typename DefaultMma::Policy, TransformA,
+                                                     QpnTransformB<type>>;
 
 template <ggml_type type>
 union SharedStorage {
