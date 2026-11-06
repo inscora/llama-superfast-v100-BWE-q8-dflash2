@@ -130,6 +130,7 @@ class EpilogueVisitorSoftmaxGqa6 {
     half const* mask;     // ggml's F16 mask, at this key block's first column
     int64_t mask_stride;  // halves per token row of the mask
     int rows;             // real packed rows (6 x tokens); rows beyond are padding
+    int exp_mode;         // [TAG_GQA6_QK_EXP] experiment: 1 no epilogue math (no mask, no max), 2 no score store, 3 both
   };
   using Arguments = Params;
 
@@ -210,6 +211,11 @@ class EpilogueVisitorSoftmaxGqa6 {
     for (int i = 0; i < kElementsPerAccess; ++i) {
       result[i] = ElementSoftmaxCompute(accum[i]) * params_.scale;
     }
+    if (params_.exp_mode & 1) {  // [TAG_GQA6_QK_EXP] the scaled logits as they are
+      if (!column_idx) first_row_fragment_ = frag_idx;
+      row_logits_[column_idx] = result;
+      return;
+    }
     // ggml's mask: one row per token, shared by its 6 packed rows
     if (column_guard && row < params_.rows) {
       uint4 const m = *reinterpret_cast<uint4 const*>(params_.mask + int64_t(row / 6) * params_.mask_stride + thread_offset_.column());
@@ -240,6 +246,14 @@ class EpilogueVisitorSoftmaxGqa6 {
     bool const row_guard = thread_offset_.row() < extent_.row();
     bool const is_write_thread = row_guard && is_first_thread_in_tile;
 
+    if (params_.exp_mode & 1) {  // [TAG_GQA6_QK_EXP] no reduction, no max, no stats
+      NumericArrayConverter<ElementOutput, ElementSoftmaxCompute, kElementsPerAccess> convert_raw;
+      CUTLASS_PRAGMA_UNROLL
+      for (int c = 0; c < kColumnIterations; ++c) {
+        reinterpret_cast<OutputVector*>(&fragment_D_)[first_row_fragment_ + c] = convert_raw(row_logits_[c]);
+      }
+      return;
+    }
     accum_max_ = warp_reduce_max_(accum_max_);
     // a fully masked tile row: probabilities 0 (exp(-inf)), max -inf
     ElementSoftmaxCompute const centre = accum_max_ == -INFINITY ? ElementSoftmaxCompute(0) : accum_max_;
@@ -284,7 +298,9 @@ class EpilogueVisitorSoftmaxGqa6 {
   CUTLASS_DEVICE
   void end_step(int step_idx) {
     GGML_UNUSED(step_idx);
-    iterator_D_.store(fragment_D_);
+    if (!(params_.exp_mode & 2)) {  // [TAG_GQA6_QK_EXP] 2: no score store
+      iterator_D_.store(fragment_D_);
+    }
     ++iterator_D_;
   }
 
@@ -373,7 +389,142 @@ struct QKParams {
   float* tile_sum;
   int64_t stats_head_stride;
   typename QKVisitor::Params visitor;
+  int scores_ld;  // [TAG_GQA6_QK_DIRECT] halves per packed row of the scores (the block's keys)
+  bool direct;    // [TAG_GQA6_QK_DIRECT] the epilogue straight from the accumulator fragments (exponential in PV only)
 };
+
+// [TAG_GQA6_QK_DIRECT] The softmax epilogue straight from the warp tiles' accumulator fragments, without the shared-memory
+// round trip of CUTLASS's epilogue (measured at a fifth of the QK kernel: a 128x256 FP32 tile through 49 KB of shared
+// memory in pieces). The fragment layout is MmaVoltaTensorOpAccumulatorTileIterator's (FP32, 32x32 interleaved tiles,
+// 16x16x4 interleaved instruction shape): a 64x64 warp tile holds, per lane, 8 rows (row0 + tm*32 + mm*4 + m*2) by 16
+// columns (col0 + tn*32 + mn*4 + pp*16 + n) with row0 = ((quad&4)/2 + (quad&1))*8 + (liq&1), col0 = ((quad>>1)&1)*8 + (liq&2),
+// quad = lane/4, liq = lane%4; the fragment index is ((((tn*2+tm)*2+mn)*2+mm)*8) + pp*4 + m*2 + n. The four lanes of a
+// row are lane ^ {0, 2, 8, 10}. Per row and 32-column group the lane pair (lane, lane^2) exchanges four values so that
+// each lane holds 8 consecutive columns (lane&2 == 0: its low 16-column half plus the partner's; else the high halves):
+// the mask (one row per token, shared by its 6 packed rows) is then read 16 bytes at a time and the FP16 (logit - max) *
+// log2(e) stored 16 bytes at a time, as the CUTLASS epilogue did, with no 4-byte accesses (a first version with per-pair
+// 4-byte loads and stores was 8% slower than the CUTLASS epilogue: twice the store sectors and an LSU queue stall, not
+// the instructions). The exact tile maximum: the lane's 16 values, the row's four lanes (xor 2, 8), the four warps along
+// N through shared memory
+static __device__ __forceinline__ void gqa6_qk_direct_epilogue(const QKParams& p, typename QKMma::FragmentC& acc,
+                                                               float* __restrict__ red, const int tile_m, const int tile_n,
+                                                               const int head, const int warp_idx, const int lane_idx) {
+  constexpr int kWarpM = TBShape::kM / WarpShape::kM;  // 2
+  const int warp_m = warp_idx % kWarpM;
+  const int warp_n = warp_idx / kWarpM;
+  const int quad = lane_idx >> 2;
+  const int liq = lane_idx & 3;
+  const int row0 = (((quad & 4) >> 1) + (quad & 1)) * 8 + (liq & 1);
+  const bool lo = (lane_idx & 2) == 0;
+  // after the exchange this lane's 8 columns of a 32-column group start at colc (lo: the low half, else the high half)
+  const int colc = ((quad >> 1) & 1) * 8 + (lo ? 0 : 16);
+  const int row_tb = tile_m * TBShape::kM + warp_m * WarpShape::kM;  // this warp's first row in rows_pad
+  const int col_tb = tile_n * TBShape::kN + warp_n * WarpShape::kN;  // this warp's first key in the block
+  const float scale = p.visitor.scale;
+
+  float c[8][2][8];  // [row slot rr][tn][column 0..7]: the scaled, masked logits
+  float rmax[8];
+  CUTLASS_PRAGMA_UNROLL
+  for (int tm = 0; tm < 2; ++tm) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int mm = 0; mm < 2; ++mm) {
+      CUTLASS_PRAGMA_UNROLL
+      for (int m = 0; m < 2; ++m) {
+        const int rr = tm * 4 + mm * 2 + m;
+        const int row = row_tb + tm * 32 + mm * 4 + m * 2 + row0;
+        const half* mrow = row < p.visitor.rows ? p.visitor.mask + int64_t(row / kQPerKV) * p.visitor.mask_stride + col_tb : nullptr;
+        float mx = -INFINITY;
+        CUTLASS_PRAGMA_UNROLL
+        for (int tn = 0; tn < 2; ++tn) {
+          float own[2][4], recv[4], send[4];  // own[pp][mn*2 + n]
+          CUTLASS_PRAGMA_UNROLL
+          for (int pp = 0; pp < 2; ++pp) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int mn = 0; mn < 2; ++mn) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int n = 0; n < 2; ++n) {
+                own[pp][mn * 2 + n] = acc[((((tn * 2 + tm) * 2 + mn) * 2 + mm) * 8) + pp * 4 + m * 2 + n];
+              }
+            }
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < 4; ++i) {
+            send[i] = lo ? own[1][i] : own[0][i];
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < 4; ++i) {
+            recv[i] = __shfl_xor_sync(0xffffffff, send[i], 2);
+          }
+          float* cc = c[rr][tn];
+          CUTLASS_PRAGMA_UNROLL
+          for (int mn = 0; mn < 2; ++mn) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int n = 0; n < 2; ++n) {
+              const float o = lo ? own[0][mn * 2 + n] : own[1][mn * 2 + n];
+              const float r = recv[mn * 2 + n];
+              cc[mn * 4 + n] = lo ? o : r;
+              cc[mn * 4 + 2 + n] = lo ? r : o;
+            }
+          }
+          float mv[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+          if (mrow != nullptr) {
+            const uint4 mw = *reinterpret_cast<const uint4*>(mrow + tn * 32 + colc);
+            const half2* m2 = reinterpret_cast<const half2*>(&mw);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < 4; ++i) {
+              const float2 f = __half22float2(m2[i]);
+              mv[2 * i] = f.x;
+              mv[2 * i + 1] = f.y;
+            }
+          }
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < 8; ++i) {
+            cc[i] = cc[i] * scale + mv[i];
+            mx = fmaxf(mx, cc[i]);
+          }
+        }
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 2));
+        mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, 8));
+        rmax[rr] = mx;
+      }
+    }
+  }
+  // the four warps along N: partial maxima per row to shared memory, then every lane reads its rows' four
+  __syncthreads();  // the main loop's shared memory is free
+  if ((lane_idx & 10) == 0) {
+    CUTLASS_PRAGMA_UNROLL
+    for (int rr = 0; rr < 8; ++rr) {
+      const int tm = rr / 4, mm = (rr / 2) % 2, m = rr % 2;
+      red[warp_n * TBShape::kM + warp_m * WarpShape::kM + tm * 32 + mm * 4 + m * 2 + row0] = rmax[rr];
+    }
+  }
+  __syncthreads();
+  half* scores = reinterpret_cast<half*>(p.scores + head * p.scores_head_stride);
+  float* tile_max = p.tile_max + head * p.stats_head_stride + int64_t(tile_n) * p.rows_pad;
+  CUTLASS_PRAGMA_UNROLL
+  for (int rr = 0; rr < 8; ++rr) {
+    const int tm = rr / 4, mm = (rr / 2) % 2, m = rr % 2;
+    const int rl = warp_m * WarpShape::kM + tm * 32 + mm * 4 + m * 2 + row0;  // row in the threadblock tile
+    const int row = tile_m * TBShape::kM + rl;
+    const float mx = fmaxf(fmaxf(red[rl], red[TBShape::kM + rl]), fmaxf(red[2 * TBShape::kM + rl], red[3 * TBShape::kM + rl]));
+    const float centre = mx == -INFINITY ? 0.0f : mx;
+    if (warp_n == 0 && (lane_idx & 10) == 0) {
+      tile_max[row] = mx;
+    }
+    half* srow = scores + int64_t(row) * p.scores_ld + col_tb + colc;
+    CUTLASS_PRAGMA_UNROLL
+    for (int tn = 0; tn < 2; ++tn) {
+      const float* cc = c[rr][tn];
+      uint4 w;
+      half2* w2 = reinterpret_cast<half2*>(&w);
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < 4; ++i) {
+        w2[i] = __float22half2_rn(make_float2((cc[2 * i] - centre) * 1.4426950408889634f, (cc[2 * i + 1] - centre) * 1.4426950408889634f));
+      }
+      *reinterpret_cast<uint4*>(srow + tn * 32) = w;
+    }
+  }
+}
 
 template <bool ExpInPV>
 static __global__ void __launch_bounds__(QKDefault::kThreadCount, 1) gqa6_qk_kernel(const QKParams p) {
@@ -397,8 +548,20 @@ static __global__ void __launch_bounds__(QKDefault::kThreadCount, 1) gqa6_qk_ker
   accumulators.clear();
   mma(kHeadDim / TBShape::kK, accumulators, iterator_A, iterator_B, accumulators);
 
-  // the visitor's Params is a nested type: the same four fields for either variant
-  const typename QKVisitorT<ExpInPV>::Params vp = { p.visitor.scale, p.visitor.mask, p.visitor.mask_stride, p.visitor.rows };
+  if (p.visitor.exp_mode == 4) {  // [TAG_GQA6_QK_EXP] no epilogue at all (one accumulator kept live)
+    if (accumulators[0] == 12345.0f) {
+      p.tile_max[0] = 1.0f;
+    }
+    return;
+  }
+  if constexpr (ExpInPV) {
+    if (p.direct) {  // [TAG_GQA6_QK_DIRECT]
+      gqa6_qk_direct_epilogue(p, accumulators, reinterpret_cast<float*>(gqa6_smem_qk), tile_m, tile_n, head, warp_idx, lane_idx);
+      return;
+    }
+  }
+  // the visitor's Params is a nested type: the same five fields for either variant
+  const typename QKVisitorT<ExpInPV>::Params vp = { p.visitor.scale, p.visitor.mask, p.visitor.mask_stride, p.visitor.rows, p.visitor.exp_mode };
   QKVisitorT<ExpInPV> visitor(vp, *reinterpret_cast<typename QKVisitorT<ExpInPV>::SharedStorage*>(&shared.epilogue.visitor), {p.rows_pad, p.width}, thread_idx, warp_idx, lane_idx, p.params_D,
                     p.scores + head * p.scores_head_stride, p.tile_max + head * p.stats_head_stride,
                     p.tile_sum + head * p.stats_head_stride, {tile_m * TBShape::kM, tile_n * TBShape::kN},
@@ -1003,6 +1166,11 @@ void ggml_cuda_flash_attn_ext_gqa6(ggml_backend_cuda_context& ctx, ggml_tensor* 
     qk.visitor.scale = scale;
     qk.visitor.mask_stride = mask->nb[1] / sizeof(half);
     qk.visitor.rows = rows;
+    static const int qk_exp_mode = gqa6_env("LLAMA_FA_GQA6_QK_EXP", 0);  // [TAG_GQA6_QK_EXP] experiment modes, wrong results
+    qk.visitor.exp_mode = qk_exp_mode;
+    static const bool qk_direct = gqa6_env("LLAMA_FA_GQA6_QK_DIRECT", 1) != 0;  // [TAG_GQA6_QK_DIRECT]
+    qk.direct = qk_direct && exp_pv;
+    qk.scores_ld = block_n;
 
     PVParams pv = {};
     pv.rows_pad = rows_pad;
