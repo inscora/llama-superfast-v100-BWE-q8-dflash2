@@ -38,7 +38,7 @@ using LayoutA = cutlass::layout::RowMajor;     // activations [tokens][K]
 using LayoutB = cutlass::layout::ColumnMajor;  // the weight [N][K] read as K x N
 using LayoutC = cutlass::layout::RowMajor;     // the product [tokens][N]
 using TBShape = cutlass::gemm::GemmShape<128, 128, 32>;
-using WarpShape = cutlass::gemm::GemmShape<64, 64, 32>;
+using WarpShape = cutlass::gemm::GemmShape<64, 32, 32>;  // 8 warps: 64 accumulators a thread, two B accesses a thread (64x64 warps: 255 registers, spills, 8 warps an SM)
 using InstShape = cutlass::gemm::GemmShape<8, 8, 4>;
 using OutputOp = cutlass::epilogue::thread::LinearCombination<float, 4, float, float>;
 
