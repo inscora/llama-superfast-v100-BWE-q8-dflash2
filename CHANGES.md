@@ -691,3 +691,14 @@ The streaming kernel's wider cap costs nothing anywhere and is +1.6% weighted, i
 is on the follow-ups of 17-64 tokens, which the benchmark's turns rarely are. The fused GEMM loses 23% of prefill at
 every depth and 3% of weighted decode (its prompt-phase share), as the probes said. The cap of 64 is the candidate for
 main; the GEMM stays off.
+
+Where the row cap acts, a chat client's follow-ups on a 180k-token conversation (`levers_probe.py`, user messages of 25
+to 1,016 prompt tokens, each prefilled on its own):
+
+| follow-up (prompt tokens) | 25 | 36 | 52 | 68 | 136 | 316 | 1,016 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| cap 16 (gqa6 from 17 rows) | 0.45 s | 0.46 s | 0.50 s | 0.51 s | 0.73 s | 1.26 s | 3.23 s |
+| cap 64 | 0.37 s | 0.36 s | 0.42 s | 0.52 s | 0.73 s | 1.26 s | 3.23 s |
+
+80-100 ms off every follow-up of up to 64 tokens at that depth (16 to 22%), nothing above the cap, nothing on cold
+prefills (950 tok/s at 16k, 538 at 180k, both ways).
