@@ -678,3 +678,9 @@ The profile's other lever, a CUTLASS GEMM that reads the repacked weights itself
 call, is on branch `prefill-levers` (`qpn-gemm.cu`, `LLAMA_QPN_GEMM=1`, off): correct across 64 shapes, and 23% slower
 on prefill at every depth, the per-value decode being 60% of a warp's MMA issue time with no spare warps to hide it.
 Its CHANGES section 27 there holds the variants and the four-way BetterBench.
+
+Cold prefill at depth on the shipped image (rsAA, `pf2.sh`, a fresh container per run, 2026-11-06, rsZ the same
+morning): 128,009 tokens in 203.5 s (629 tok/s; rsZ 205.8 s, 622), 243,576 tokens in 530.7 s (459 tok/s; rsZ 531.2 s,
+459); the slot's limit is 245,760 cells, so 244k is the most one conversation can hold. Both sit on the curve of the
+earlier points (818 tok/s at 64k, 538 at 180k, 505-509 at 200k): the cap changes nothing on a cold prefill, which runs
+in 2,048-row chunks on gqa6 either way.
