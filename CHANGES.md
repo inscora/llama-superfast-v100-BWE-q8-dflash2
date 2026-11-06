@@ -731,3 +731,9 @@ is within a few percent of what the register file allows at head dimension 256.
 On the server (the dev build, one slot, a cold 128k prefill, `qkdirect-srv.sh`): 643 tok/s against 617 with the
 switch off (199.1 s against 207.4), +4% where the attention is about half the prefill; at 244k, where it is 70%, the
 cap is about +7%. Candidate for main.
+
+BetterBench (temperature 1.0, the production launcher, 2026-11-06, rsAA the same session): rsAB (this epilogue) 102.2
+weighted decode, 90.1 / 123.6 / 156.0 aggregate tok/s at 1 / 2 / 4 requests, prefill 951 / 948 / 826 tok/s at 2k /
+16k / 64k; rsAA 101.1, 94.2 / 120.5 / 161.7, 951 / 945 / 816. Inside the spread everywhere but the 64k prefill (+1%),
+as expected: the benchmark's depths are where the attention is a small share. No errors, peak VRAM unchanged (31.9 GB).
+Adopted: main, image rsAB.
