@@ -88,8 +88,14 @@ static __device__ __forceinline__ QpnHeader<type> qpn_gemm_header(const char* __
   return h;
 }
 
-// the access's code word(s) and, from the cached header, its scale and min: the same float operations as
-// qpn_to_fp16_fast_kernel (Q4_K/Q5_K: d = dall*sc, mm = dmin*m; Q6_K: d*sc; IQ4_XS: d*(ls - 32))
+// byte i of the four words, selected in registers (an indexed local array would live in local memory)
+static __device__ __forceinline__ uint32_t qpn_gemm_byte(const uint4 w, const int i) {
+  const uint32_t v = i < 4 ? w.x : i < 8 ? w.y : i < 12 ? w.z : w.w;
+  return (v >> (8 * (i & 3))) & 0xFF;
+}
+
+// the access's code word(s) and, from the row's header, its scale and min: the same float operations as
+// qpn_to_fp16_fast_kernel (Q4_K/Q5_K: d = dall*sc, mm = dmin*m with get_scale_min_k4's bytes; Q6_K: d*sc; IQ4_XS: d*(ls - 32))
 template <ggml_type type>
 static __device__ __forceinline__ void qpn_gemm_load_raw(const char* __restrict__ tsb, const int r, const int j, const int q,
                                                          const QpnHeader<type>& h, uint32_t* raw) {
@@ -100,26 +106,34 @@ static __device__ __forceinline__ void qpn_gemm_load_raw(const char* __restrict_
     raw[1] = type == GGML_TYPE_Q5_K ? *(const uint32_t*) (tsb + (1 + j / 4) * QPN_CHUNK + r * 16 + 4 * (j % 4)) : 0u;
     half2 dm;
     memcpy(&dm, &h.w.x, 4);
-    const uint32_t sw[3] = {h.w.y, h.w.z, h.w.w};
     const float dall = __low2half(dm);
     const float dmin = __high2half(dm);
-    uint8_t sc, m;
-    get_scale_min_k4(j, (const uint8_t*) sw, sc, m);
-    scale = dall * sc;
-    mn = dmin * m;
+    // get_scale_min_k4 on the 12 scale bytes (bytes 4..15 of the header)
+    const uint4 sw = make_uint4(h.w.y, h.w.z, h.w.w, 0u);
+    uint32_t sc, m;
+    if (j < 4) {
+      sc = qpn_gemm_byte(sw, j) & 63;
+      m = qpn_gemm_byte(sw, j + 4) & 63;
+    } else {
+      sc = (qpn_gemm_byte(sw, j + 4) & 0xF) | ((qpn_gemm_byte(sw, j - 4) >> 6) << 4);
+      m = (qpn_gemm_byte(sw, j + 4) >> 4) | ((qpn_gemm_byte(sw, j) >> 6) << 4);
+    }
+    scale = dall * (uint8_t) sc;
+    mn = dmin * (uint8_t) m;
   } else if constexpr (type == GGML_TYPE_Q6_K) {
     raw[0] = *(const uint32_t*) (tsb + j * QPN_CHUNK + r * 16 + 4 * q);
     raw[1] = *(const uint32_t*) (tsb + (8 + j / 2) * QPN_CHUNK + r * 16 + 4 * ((2 * j) % 4) + (q < 2 ? 0 : 4));
-    const int8_t* scales = (const int8_t*) &h.w;
     const float d = __ushort_as_half((uint16_t) h.extra);
     const int ip = j / 4, q4 = j % 4;
-    scale = d * scales[8 * ip + q / 2 + 2 * q4];  // l/16 == q/2 for l = 8q + s
+    scale = d * (int8_t) qpn_gemm_byte(h.w, 8 * ip + q / 2 + 2 * q4);  // l/16 == q/2 for l = 8q + s
   } else if constexpr (type == GGML_TYPE_IQ4_XS) {
     raw[0] = *(const uint32_t*) (tsb + j * QPN_CHUNK + r * 16 + 4 * q);
     raw[1] = 0u;
-    block_iq4_xs b;
-    memcpy(&b, &h.w, 8);  // d, scales_h, scales_l
-    scale = (float) b.d * ((((b.scales_l[j / 2] >> 4 * (j % 2)) & 0xf) | (((b.scales_h >> 2 * j) & 3) << 4)) - 32);
+    // the tail: d (bytes 0-1), scales_h (2-3), scales_l (4-7)
+    const float d = __ushort_as_half((uint16_t) (h.w.x & 0xFFFF));
+    const uint32_t scales_h = h.w.x >> 16;
+    const uint32_t ls = ((qpn_gemm_byte(h.w, 4 + j / 2) >> (4 * (j % 2))) & 0xf) | (((scales_h >> (2 * j)) & 3) << 4);
+    scale = d * ((int) ls - 32);
   }
   raw[2] = __float_as_uint(scale);
   raw[3] = __float_as_uint(mn);
@@ -168,7 +182,7 @@ static __device__ __forceinline__ void qpn_gemm_decode8(const uint32_t* raw, cut
 // The B operand iterator over a repacked weight of N rows and K = 256*nsb columns: the interface MmaPipelined uses
 // (load, ++, clear_mask), the thread map of the GEMM's own B iterator, and its fragment order (strided iterations, then
 // the access), so the transform's output is stored as the predicated iterator's fragment would be. The fragment holds
-// the raw words; the row headers are kept per row and reloaded when the superblock changes
+// the raw words; the row header (16 bytes, the same for 8 k-steps and the 4 lanes of a row) is read per access
 template <ggml_type type>
 struct QpnIteratorB {
   using Element = uint32_t;
@@ -186,13 +200,11 @@ struct QpnIteratorB {
   int nsb_;
   int n_;
   int k_;                                        // first K column of this thread's accesses
-  int sb_;                                       // the superblock the headers belong to
   int row_[ThreadMap::Iterations::kStrided];     // the rows of this thread's accesses
-  QpnHeader<type> header_[ThreadMap::Iterations::kStrided];
   bool masked_;
 
   CUTLASS_DEVICE QpnIteratorB(const Params& p, int thread_idx, int k0, int n0)
-      : w_(p.w), nsb_(p.nsb), n_(p.n), sb_(-1), masked_(false) {
+      : w_(p.w), nsb_(p.nsb), n_(p.n), masked_(false) {
     const auto offset = ThreadMap::initial_offset(thread_idx);
     k_ = k0 + offset.contiguous();
     CUTLASS_PRAGMA_UNROLL
@@ -206,19 +218,6 @@ struct QpnIteratorB {
     const int sb = k_ / QK_K;
     const int j = (k_ % QK_K) / 32;
     const int q = (k_ % 32) / 8;
-    if (!masked_ && sb != sb_) {
-      sb_ = sb;
-      CUTLASS_PRAGMA_UNROLL
-      for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
-        const int row = row_[s];
-        if (row < n_) {
-          header_[s] = qpn_gemm_header<type>(w_ + ((int64_t) (row / 32) * nsb_ + sb) * kTSB, row % 32);
-        } else {
-          header_[s].w = make_uint4(0, 0, 0, 0);
-          header_[s].extra = 0u;
-        }
-      }
-    }
     CUTLASS_PRAGMA_UNROLL
     for (int s = 0; s < ThreadMap::Iterations::kStrided; ++s) {
       const int row = row_[s];
@@ -231,7 +230,7 @@ struct QpnIteratorB {
         continue;
       }
       const char* tsb = w_ + ((int64_t) (row / 32) * nsb_ + sb) * kTSB;
-      qpn_gemm_load_raw<type>(tsb, row % 32, j, q, header_[s], raw);
+      qpn_gemm_load_raw<type>(tsb, row % 32, j, q, qpn_gemm_header<type>(tsb, row % 32), raw);
     }
   }
 
