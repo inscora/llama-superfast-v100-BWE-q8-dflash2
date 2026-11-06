@@ -684,3 +684,50 @@ morning): 128,009 tokens in 203.5 s (629 tok/s; rsZ 205.8 s, 622), 243,576 token
 459); the slot's limit is 245,760 cells, so 244k is the most one conversation can hold. Both sit on the curve of the
 earlier points (818 tok/s at 64k, 538 at 180k, 505-509 at 200k): the cap changes nothing on a cold prefill, which runs
 in 2,048-row chunks on gqa6 either way.
+
+## 28. The attention's structure at depth (branch attn-depth)
+
+The question from section 27: with the attention at 61% of a 174k prefill and 70% at 244k, and the gqa6 route at 42
+TFLOPS against 1Cat's 71 (300 W SXM2) and 54 (their same kernel at 185 W), what does the card allow. Measured on the
+1,024-row x 172k-key perf case (`test-backend-ops perf`, Q8_0 K/V, exponential in PV), the production shape.
+
+**The GEMMs themselves.** cuBLAS on the two attention shapes (`cublasbench.cu`, fp16 in, fp32 accumulate, 6 heads
+packed, batch 4): the 256-deep QK product reaches 52-58 TFLOPS (fp16 out; 42-56 fp32 out) and PV 57-66, both on
+64x128 tiles (`volta_s884gemm_fp16_64x128_ldg8`). A 256-deep GEMM runs at half the card's peak however it is written;
+the 1Cat design (cuBLAS for both products, a separate softmax pass over an FP32 score buffer) would, on this card,
+pay the extra pass out of that and land where the fused-epilogue route already is. Nothing to port.
+
+**Where the QK kernel's time went.** With the epilogue stripped in stages (`LLAMA_FA_GQA6_QK_EXP`, wrong results): the
+main loop alone is 30 ms of the kernel's 59 per call (72 TFLOPS-equivalent, tensor pipe 80% active); CUTLASS's
+epilogue was the other half: the FP32 tile through 49 KB of shared memory in pieces 12 ms, the FP16 score store 6.5,
+the mask, maximum and sums 9. PV is 42 ms (254 registers, no spills, tensor pipe 56%, stalled on the score loads: 57%
+L2 hits, the scores stream from DRAM); the exponential in its load costs 5% of it.
+
+**The direct epilogue** (`TAG_GQA6_QK_DIRECT`, `LLAMA_FA_GQA6_QK_DIRECT=0` keeps CUTLASS's): the softmax straight from
+the accumulator fragments (the Volta interleaved layout: 8 rows by 16 columns a lane). A first version with 4-byte
+loads and stores was 8% slower than CUTLASS (twice the store sectors, an LSU queue stall). With a lane-pair exchange
+giving each lane 8 consecutive keys, so the mask is read and the scores stored 16 bytes at a time: 41.6 -> 45.7 TFLOPS
+at 1,024 and 2,048 rows, 34.3 -> 37.2 at 128 (QK 59 -> 50 ms); the exact tile maximum, bit-identical scores, the 60
+six-head Q8_0 eval cases pass. What the 20 ms of epilogue still are (the same stripping): the score store 8 ms, the
+mask and maximum 3.4, the cross-warp exchange 0.6, the rest arithmetic and conversions on a latency-bound chain with
+two warps a scheduler. Variants that did not move it: statistics per 64-key warp tile with no barrier (-2%: four
+times the scale reloads in PV); the mask tile parked in shared memory before the main loop (0); scores stored in
+fragment order with V widened in the same key order, no exchange at all (0, and 1,000 fewer instructions a warp and
+tile: the chain is not instruction-bound); the first wave's odd blocks delayed half a tile so the SMs' store phases
+stop coinciding (0); evict-first score stores (0, though the score stream does push K and Q out of L2: 75% hits
+against 90% without stores, 98 MB of DRAM reads a launch against 39); a 64-deep pipeline stage (CUTLASS's Volta
+layouts do not support it: illegal access). On the PV side: prefetching the scores to L2 one to four stages ahead
+(-1 to -4%), three or four key splits or a split count that follows the row count (-7% at 1,024 rows, noise at 128).
+
+**The fused kernel, bounded before it was written.** A Volta flash-attention kernel (QK tile, softmax in registers,
+P through shared memory into PV, O in registers) removes the score round trip (the 8 ms store, PV's DRAM-latency
+loads) but has to hold O (64 rows x 256 dims in FP32 = 64 registers a thread with 8 warps) beside the QK accumulators
+and the double-buffered fragments, so its warp tiles are 32x64, not 64x64. The QK main loop alone, re-tiled
+(`LLAMA_FA_GQA6_QK_EXP=4`): 128x256 / 64x64 warps 30 ms, 128x128 / 64x32 35.5 (+18%), 64x256 / 32x64 38 (+26%),
+64x128 / 32x32 47.5 (+58%). Both GEMM phases at +26% cost about what the round trip saves; the expected net is 0 to
++5% for a multi-day kernel with spill risk. Not written. On this card the two-kernel route with the direct epilogue
+is within a few percent of what the register file allows at head dimension 256.
+
+On the server (the dev build, one slot, a cold 128k prefill, `qkdirect-srv.sh`): 643 tok/s against 617 with the
+switch off (199.1 s against 207.4), +4% where the attention is about half the prefill; at 244k, where it is 70%, the
+cap is about +7%. Candidate for main.
