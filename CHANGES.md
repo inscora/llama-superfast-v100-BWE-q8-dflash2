@@ -646,3 +646,35 @@ Probe (`cancel_probe.py`: a 41k-token conversation, then an 8k-token follow-up c
 before, the retry read 51,719 and 62,106 tokens (the conversation gone each time); now 10,348 both times, the follow-up
 plus the re-read from the last checkpoint, with the cancelled job's 2,048 cached tokens discarded as the state past
 the kept prefix.
+
+## 27. The streaming kernel takes prompts of up to 64 tokens
+
+A profile of production's prefill (2026-11-05, branch `prefill-levers`, `profall.sh`): shallow, the weights GEMM is
+62% of the kernel time at 75% of the card's peak, the per-call expansion of the repacked weights to fp16 9%, the gqa6
+attention 12%, the GDN kernels 10%; at 174k tokens the attention is 61%. The attention route pads a prompt's rows to
+128-row tiles: 17 rows run at 7.5 TFLOPS, 32 at 13, 128 at 35, 1,024 and more at 42.
+
+Now (`TAG_FVS_ROWS`) the decode attention kernel, which streams the Q8_0 cache in 8-token blocks, takes prompts of up to
+64 tokens (`LLAMA_FATTN_VERIFY_STREAM_MAX_TOK`, a multiple of 8 from 8 to 64; 16 was the cap, and `=16` restores it).
+Above 16 tokens each block streams the keys on its own, as the second block of 9-16 tokens already did. At 172k keys a
+17-row call takes 3.2 ms instead of the gqa6 route's 9.5, 32 rows 4.4 instead of 10.4, 64 rows 8.4 instead of 11.4;
+128 rows and more stay on gqa6. The eval cases at 17 and 64 rows pass; a 64-row perf case joins the list.
+
+Where it acts, a chat client's follow-ups on a 180k-token conversation (`levers_probe.py`, user messages of 25 to
+1,016 prompt tokens, each prefilled on its own after its checkpoint):
+
+| follow-up (prompt tokens) | 25 | 36 | 52 | 68 | 136 | 316 | 1,016 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| cap 16 (gqa6 from 17 rows) | 0.45 s | 0.46 s | 0.50 s | 0.51 s | 0.73 s | 1.26 s | 3.23 s |
+| cap 64 | 0.37 s | 0.36 s | 0.42 s | 0.52 s | 0.73 s | 1.26 s | 3.23 s |
+
+80-100 ms off every follow-up of up to 64 tokens at that depth (16 to 22%), nothing above the cap, nothing on cold
+prefills (950 tok/s at 16k, 538 at 180k, both ways). BetterBench (temperature 1.0, the production launcher, 2026-11-06):
+106.3 weighted against the rsZ baseline's 104.6 the same night, 92.4 / 120.2 / 161.0 aggregate tok/s at 1 / 2 / 4
+requests against 92.5 / 119.4 / 158.8, prefill 955 / 944 / 820 tok/s at 2k / 16k / 64k against 950 / 942 / 818: inside
+the spread, as the benchmark's turns are rarely that small.
+
+The profile's other lever, a CUTLASS GEMM that reads the repacked weights itself instead of expanding them to fp16 per
+call, is on branch `prefill-levers` (`qpn-gemm.cu`, `LLAMA_QPN_GEMM=1`, off): correct across 64 shapes, and 23% slower
+on prefill at every depth, the per-value decode being 60% of a warp's MMA issue time with no spare warps to hide it.
+Its CHANGES section 27 there holds the variants and the four-way BetterBench.
