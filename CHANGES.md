@@ -671,3 +671,23 @@ route pads a prompt's rows to 128-row tiles: 17 rows run at 7.5 TFLOPS, 32 at 13
   64x64) leave 8 warps an SM, so nothing overlaps it: 705 tok/s against 950 for the expansion and cuBLAS on a 16k
   prefill (variants: 64x64 warps 590, 64x32 capped at 128 registers 315, 32x32 warps 685). It stays in the tree off by
   default; the 9% it was after needs a kernel that decodes with spare warps, which a two-stage Volta pipeline does not have.
+  On the server (`levers_probe.py`, 180k conversation): the cold 180k prefill 450 tok/s against 541, a cold 16k 704
+  against 950.
+
+A note from the probe: a follow-up sent as a raw completion (no user-message boundary) re-reads the recurrent
+checkpoint window, 2,005 tokens whatever it adds (5.7 s at 180k); a chat follow-up carries a checkpoint at its user
+message and prefills its own tokens. The levers probe measures follow-ups through the chat endpoint for that reason.
+
+BetterBench (temperature 1.0, the production launcher, 2026-11-06, the rsZ baseline the same night):
+
+| build | weighted decode | aggregate t/s at 1 / 2 / 4 requests | prefill tok/s at 2k / 16k / 64k |
+|---|--:|--:|--:|
+| rsZ (baseline) | 104.6 | 92.5 / 119.4 / 158.8 | 950 / 942 / 818 |
+| streaming kernel to 64 rows | 106.3 | 92.4 / 120.2 / 161.0 | 955 / 944 / 820 |
+| fused qpn GEMM | 101.2 | 89.8 / 119.3 / 154.6 | 727 / 699 / 632 |
+| both | 104.4 | 89.5 / 116.7 / 155.9 | 724 / 704 / 632 |
+
+The streaming kernel's wider cap costs nothing anywhere and is +1.6% weighted, inside the run-to-run spread; its gain
+is on the follow-ups of 17-64 tokens, which the benchmark's turns rarely are. The fused GEMM loses 23% of prefill at
+every depth and 3% of weighted decode (its prompt-phase share), as the probes said. The cap of 64 is the candidate for
+main; the GEMM stays off.
