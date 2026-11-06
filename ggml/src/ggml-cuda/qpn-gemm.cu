@@ -287,7 +287,7 @@ struct GemmParams {
 };
 
 template <ggml_type type>
-static __global__ void __launch_bounds__(Default::kThreadCount, 2) qpn_gemm_kernel(const GemmParams p) {
+static __global__ void __launch_bounds__(Default::kThreadCount, 1) qpn_gemm_kernel(const GemmParams p) {
   extern __shared__ int4 qpn_gemm_smem[];
   SharedStorage<type>& shared = *reinterpret_cast<SharedStorage<type>*>(qpn_gemm_smem);
 
