@@ -646,3 +646,28 @@ Probe (`cancel_probe.py`: a 41k-token conversation, then an 8k-token follow-up c
 before, the retry read 51,719 and 62,106 tokens (the conversation gone each time); now 10,348 both times, the follow-up
 plus the re-read from the last checkpoint, with the cancelled job's 2,048 cached tokens discarded as the state past
 the kept prefix.
+
+## 27. Two prefill levers from the profile (branch prefill-levers)
+
+A profile of production's prefill (2026-11-05, `profall.sh`): shallow, the weights GEMM is 62% of the kernel time in
+cuBLAS's `cutlass_70_tensorop_s884gemm_f16_128x128` at 75% of the card's peak, the per-call expansion of the repacked
+weights to fp16 9%, the gqa6 attention 12%, the GDN kernels 10%; at 174k tokens the attention is 61%. And the attention
+route pads a prompt's rows to 128-row tiles: 17 rows run at 7.5 TFLOPS, 32 at 13, 128 at 35, 1024 and more at 42.
+
+- **The streaming kernel for 17-64-row prompts** (`TAG_FVS_ROWS`, `LLAMA_FATTN_VERIFY_STREAM_MAX_TOK=64`; default 16). The
+  decode kernel streams the Q8_0 cache in 8-token blocks; above 16 tokens each block streams the keys on its own, as
+  the second block of 9-16 tokens already did. At 172k keys a 17-row call takes 3.2 ms instead of the gqa6 route's 9.5,
+  32 rows 4.4 instead of 10.4, 64 rows 8.4 instead of 11.4; 128 rows stay on gqa6. The eval cases at 17 and 64 rows pass.
+- **The fused qpn GEMM** (`TAG_QPN_GEMM`, `LLAMA_QPN_GEMM=1`; `qpn-gemm.cu`). Above the tensor-core kernel's width a
+  repacked weight was expanded to fp16 per call for cuBLAS. The same CUTLASS Volta GEMM (128x128x32 threadblock, 64x64
+  warps, two stages, fp32 accumulators) now reads the repacked chunks itself: its B-operand iterator loads one 32-bit
+  code word per 8-element access (the thread map's access is 8 consecutive K columns of one row, one chunk word) and
+  decodes it with the expansion kernel's arithmetic between the global load and the shared-memory store. Q4_K, Q5_K,
+  Q6_K and IQ4_XS (96% of the 27B's bytes); the others expand as before. `LLAMA_QPN_GEMM_CHECK=1` runs the expansion
+  and cuBLAS too and logs the largest difference per shape: 64 shapes of a 16k prefill, most bit-identical (the same
+  mainloop, the same order), the rest within 3.4e-5 relative.
+  Correct, and slower: the decode's ALU work per k-step (byte selects, one multiply-subtract and a rounding per value)
+  is about 60% of a warp's MMA issue time, and the kernel's registers (167 at 64x32 warp tiles, 255 with spills at
+  64x64) leave 8 warps an SM, so nothing overlaps it: 705 tok/s against 950 for the expansion and cuBLAS on a 16k
+  prefill (variants: 64x64 warps 590, 64x32 capped at 128 registers 315, 32x32 warps 685). It stays in the tree off by
+  default; the 9% it was after needs a kernel that decodes with spare warps, which a two-stage Volta pipeline does not have.

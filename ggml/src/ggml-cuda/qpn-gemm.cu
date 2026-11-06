@@ -38,7 +38,11 @@ using LayoutA = cutlass::layout::RowMajor;     // activations [tokens][K]
 using LayoutB = cutlass::layout::ColumnMajor;  // the weight [N][K] read as K x N
 using LayoutC = cutlass::layout::RowMajor;     // the product [tokens][N]
 using TBShape = cutlass::gemm::GemmShape<128, 128, 32>;
-using WarpShape = cutlass::gemm::GemmShape<32, 32, 32>;  // 16 warps: 32 accumulators a thread, one B access a thread, so other warps' MMAs overlap a warp's decode
+// 8 warps of 64x32: 167 registers, no spills, one block an SM. Measured on a 16k prefill against the expansion + cuBLAS
+// (950 tok/s): 64x64 warps 255 registers with spills, 590; 64x32 capped at 128 registers, 315 (spills); 64x32 uncapped
+// 705; 32x32 warps (16) 685. The decode's ALU work per k-step is about 60% of a warp's MMA issue time, and with 8 warps an
+// SM nothing overlaps it: the kernel stays ~1.35x behind cuBLAS, so the route is off by default (CHANGES.md section 27)
+using WarpShape = cutlass::gemm::GemmShape<64, 32, 32>;
 using InstShape = cutlass::gemm::GemmShape<8, 8, 4>;
 using OutputOp = cutlass::epilogue::thread::LinearCombination<float, 4, float, float>;
 
