@@ -320,6 +320,14 @@ static void qpn_gemm_launch(const GemmParams& p, cudaStream_t stream) {
   const int id = ggml_cuda_get_device();
   std::call_once(once[id], [] {
     CUDA_CHECK(cudaFuncSetAttribute(qpn_gemm_kernel<type>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem));
+    int occ = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, qpn_gemm_kernel<type>, Default::kThreadCount, smem);
+    cudaFuncAttributes attr = {};
+    cudaFuncGetAttributes(&attr, qpn_gemm_kernel<type>);
+    GGML_LOG_WARN("qpn gemm %s: shared %zu B (mainloop %zu, epilogue %zu), %d regs, %zu B local, %d threads, %d blocks/SM
+",
+                  ggml_type_name(type), smem, sizeof(typename Mma<type>::SharedStorage), sizeof(typename Epilogue::SharedStorage),
+                  attr.numRegs, attr.localSizeBytes, Default::kThreadCount, occ);
   });
   const dim3 grid((p.n + TBShape::kN - 1) / TBShape::kN, (p.m + TBShape::kM - 1) / TBShape::kM, 1);
   qpn_gemm_kernel<type><<<grid, Default::kThreadCount, smem, stream>>>(p);
