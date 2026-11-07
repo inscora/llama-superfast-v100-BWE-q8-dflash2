@@ -3017,6 +3017,10 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP_EXP,
         MODEL_TENSOR.FFN_GATE_EXP,
         MODEL_TENSOR.FFN_GATE_UP_EXP,
+        # a dense sibling of the line (no experts) carries the plain SwiGLU instead
+        MODEL_TENSOR.FFN_GATE,
+        MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.PER_LAYER_TOKEN_EMBD,
         MODEL_TENSOR.PLE_KEY,
         MODEL_TENSOR.PLE_VALUE,

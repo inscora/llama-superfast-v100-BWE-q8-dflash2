@@ -560,6 +560,24 @@ void common_models_handler_apply(common_models_handler & handler, common_params 
         }
     }
 
+    // [TAG_QWEN4_MTP] the qwen4exp line (Qwen3.8-Flash-Next and what follows it) drafts with its own MTP head by
+    // default; DFlash2 is the 27B's draft. With a draft file and no --spec-type, the target's architecture decides
+    // before the draft file's metadata does: an MTP head, or a file that says nothing, drafts as MTP; a file of
+    // another draft kind is kept and said so. An explicit --spec-type is kept as given
+    if (spec_types_is_default(params) && !params.speculative.draft.mparams.path.empty() && !params.model.path.empty()) {
+        const std::string arch_tgt = common_model_arch_from_gguf(params.model.path);
+        if (arch_tgt == "qwen4exp") {
+            const auto types_gguf = common_speculative_types_from_gguf(params.speculative.draft.mparams.path);
+            if (types_gguf.empty() || types_gguf == std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_DRAFT_MTP}) {
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+                LOG_INF("%s: the target is qwen4exp: drafting with its MTP head (the architecture's default; --spec-type overrides)\n", __func__);
+            } else {
+                LOG_WRN("%s: the target is qwen4exp, whose default draft is its MTP head, but the draft file is a '%s' draft: kept as given\n",
+                        __func__, common_speculative_type_to_str(types_gguf[0]).c_str());
+            }
+        }
+    }
+
     // infer the speculative type from the draft GGUF metadata when none is requested
     // note: reads only the first split - sharded drafts need an explicit --spec-type
     if (spec_types_is_default(params) && !params.speculative.draft.mparams.path.empty()) {

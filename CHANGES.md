@@ -737,3 +737,104 @@ weighted decode, 90.1 / 123.6 / 156.0 aggregate tok/s at 1 / 2 / 4 requests, pre
 16k / 64k; rsAA 101.1, 94.2 / 120.5 / 161.7, 951 / 945 / 816. Inside the spread everywhere but the 64k prefill (+1%),
 as expected: the benchmark's depths are where the attention is a small share. No errors, peak VRAM unchanged (31.9 GB).
 Adopted: main, image rsAB.
+
+## 29. The Qwen4 line (Qwen3.8-Flash-Next, `qwen4exp`) on this fork, blind
+
+Written for weights that have not shipped: Qwen4-27B was named at Apsara on 2026-09-22 with no specification, and
+Qwen3.8-Flash-Next (2026-08-28) is the published preview of its architecture. Nothing in this section has run on a
+GPU; the branch was built for the card and tested on the CPU only. The reference is
+[bitexploder/fnfl-v100](https://github.com/bitexploder/fnfl-v100), read in full first.
+
+**What the line is.** Qwen3.8-Flash-Next (HF `model_type` `qwen4_exp`, GGUF architecture `qwen4exp`): 48 layers of
+width 2,560, a 248,320-token vocabulary, 262,144 tokens of context. The residual is four hyper-connection streams
+mixed by low-rank (320) mixers in place of every layer norm. Three of every four layers are gated delta-net linear
+attention (48 value heads of 128, 16 key heads, a width-4 convolution: the qwen35 line's GDN); every fourth is QSA,
+sparse full attention: 24 query heads over 2 KV heads of dimension 256 with a sigmoid output gate, and an indexer
+(4 heads of 128) that scores the history in blocks of 4 cells so each query attends at most 2,048 selected cells
+plus the tail. The feed-forward is 512 routed experts (10 a token, 640 wide) and one shared expert; a 26.9 GiB
+n-gram table (PLE) in host memory adds 16 rows a token before layer 1; an MTP block (one QSA layer with its own
+experts, sharing the trunk's embeddings and head) ships as a separate GGUF and is the model's own draft. The
+published quantizations are 75.8 GB (IQ3_XXS) and 111 GB (UD-Q4_K_XL): the model itself does not fit one V100 32 GB
+without an expert cache in host memory. Whether Qwen4-27B keeps this architecture, and whether it is dense or a
+mixture, is not public.
+
+**What fnfl-v100 is, and what it says.** Not a llama.cpp port: a from-scratch CUDA engine (`fn/`) for exactly this
+model on two V100s (one with its expert cache), with llama.cpp's server, tokenizer and GGUF reader around it.
+Nothing of it transplants into ggml; what it gives is the architecture (`fn/model/shapes.h`, `docs/fnfl/engine.md`)
+and the metadata contract it checks at load (`fn/glue/fnfl_glue.cpp`, `fn/loader/`): `qwen4exp.block_count`,
+`.embedding_length`, `.context_length`, `.attention.head_count`, `.attention.head_count_kv`, `.expert_count`,
+`.hyper_connection.count`, `.ple.conv_kernel`, `.ple.ngram_size`, and the tensors `blk.N.hc_attn_{norm,down,up}`,
+`ffn_{gate,up,down}_exps`, `ffn_{gate,up,down}_shexp`, `ffn_gate_inp`. Our converter writes every one of them
+(`conversion/qwen4exp.py`, `gguf-py/gguf/constants.py`): the Unsloth and ISTA-DASLab files fnfl-v100 serves are
+what it produces.
+
+**What was already in the tree.** The llama.cpp side of the line came with upstream (Unsloth build b11030 of
+ggml-org/llama.cpp, 2026-09-18, through bitexploder's import) and bitexploder's V100 work: the converter and the
+GGUF keys above, `src/models/qwen4exp.cpp` with its hyper-connection, GDN, QSA, PLE and MTP graphs, the attention
+and indexer caches of `llama-memory-hybrid-idx.cpp`, the compact selected-KV decode path
+(`models/qwen4exp-qsa-compact.h`), the block-sparse prompt kernel ported from PentaCoxian's patch set
+(`ggml-cuda/qsa-attn.cu`, `qsa-select.cu`, `qsa-union.cu`), the draft vocabulary ranking
+`models/draft-vocab-qwen3.8-flash-next.txt` (65,536 ids, taken by default for a qwen4exp MTP draft), and the tests
+`test-qsa-compact`, `test-qsa-select`, `test-qsa-host-meta`. Upstream bitexploder served it on two cards with the
+MTP head (`--spec-type draft-mtp --spec-draft-n-max 2 -ctk bf16 -ctv bf16`, layer split), never on one. This fork's
+27B-only paths were already gated off the line: the KV window and the whole-cache decode graph (`qwen35` only,
+sections 4 and 27), the MTP chain on the device (`llama_mtp_chain_supported`, qwen35), block verification's
+default, the two-user scheduler (`supports_layer_groups`, qwen35: it logs "not engaged" and prompts run as plain
+batches).
+
+**What this branch adds** (branch `qwen4`, each tagged in the source):
+
+- `TAG_QWEN4_KV` (`llama-context.cpp`): the line's sparse paths read an F16 or BF16 cache only (the block-sparse
+  prompt kernel and the compact decode path both refuse a quantized K/V), and the 27B's Q8_0 routes (section 1) are
+  built for six heads of 256. A quantized `-ctk`/`-ctv` on a qwen4exp model would have left every QSA layer on the
+  whole-cache dense attention with an F16 widening of the cache per call, silently. The context now replaces it by
+  F16 with a warning; `LLAMA_QWEN4EXP_KV_QUANT=1` keeps the requested types. At 262,144 tokens the line's F16 cache
+  is 12 layers x 2 heads x 256 x 2 (K and V) x 2 bytes = 24 KiB a token, 6.3 GB, plus the indexer's keys.
+- `TAG_QWEN4_MTP` (`common/arg.cpp`, `common/speculative.cpp`): with a draft file and no `--spec-type`, a qwen4exp
+  target drafts with its MTP head before the draft file's metadata is consulted (an MTP file, or one that says
+  nothing, is MTP; a file of another draft kind is kept and said so); a `--spec-type` given is kept as given.
+  DFlash2 stays the 27B's draft and its default. The launcher's `PHASE=mtp` is the same choice made explicit.
+- `TAG_QWEN4_ROUTES` (`fattn-gqa6.cu`, `fattn-verify-stream.cu`): the two 27B kernels say once, in the log, when a
+  head configuration is not theirs (the head dimension, the query heads per KV head: the line has 12 per KV head,
+  the routes pack 6 of 256) and leave it to the generic Volta kernels. They were silent about it; every other
+  assumption of theirs is a shape test that already fell through. The line goes through them to the mma kernel
+  for prompts (12 % 4 == 0) and the tile or vec kernels for decode, with the QSA selection in front of both.
+- `TAG_QWEN4_DENSE` (`qwen4exp.cpp`, `constants.py`): a qwen4exp file with no `expert_count` loads and runs the qwen35
+  line's plain SwiGLU (`ffn_gate`, `ffn_up`, `ffn_down`) in both graphs, the trunk's and the MTP block's, and the
+  converter maps `mlp.{gate,up,down}_proj` for it. Should Qwen4-27B be a dense model of this architecture under the
+  same class name, it converts and loads; should it come as a new `model_type`, the converter needs its class
+  registered (`@ModelBase.register`) and the C++ side a look at what changed, and this section is the map.
+- `test-llama-archs` generates the dense variant beside the MoE one (qwen4exp left `moe_mandatory`), so the dense
+  graph is built, saved, reloaded and decoded on the CPU by the existing tests.
+
+**What was verified, on the CPU.** The CUDA build (sm_70, the production configuration: `GGML_CUDA_FA_ALL_QUANTS=OFF`, tests on) and a CPU-only build (`GGML_CUDA=OFF`) of `llama-server`, `test-backend-ops` and the tests below compile clean of new warnings. On the CPU build: `test-llama-archs` synthesises a qwen4exp model in both variants (dense 15.7 MB, MoE 19.2 MB; before this branch it generated neither, qwen4exp being MoE-mandatory and not MoE-implemented), and `test-save-load-state` decodes each, saves and restores its state and checks the continuation (7 checks a model, both pass); `test-generate-models` and `test-save-load-state` over every architecture pass, `test-spec-rejection`, `test-spec-draft-grammar`, `test-qsa-host-meta` and `test-qsa-select` (its CPU half) pass. One pre-existing failure, unrelated and the same on the unpatched main: `test-recurrent-state-rollback` on the synthetic qwen35 aborts in the CPU build (`llama_memory_recurrent::state_write`, `rs_depth` assert, reached from `common_prompt_checkpoint::update_tgt`); the CUDA build's test binaries link libcuda and cannot run without a card. The GPU halves of the QSA tests, `test-backend-ops` against the CUDA backend, and everything below are not run.
+
+**What is blind, to verify when the weights arrive** (in this order, each a short run on AgentK with the user's go):
+
+1. The architecture of the weights against this section: `model_type` and class name, dense or mixture, head counts
+   and head dimension, hyper-connection count, PLE present or not, MTP block present or not. A head dimension other
+   than 256 takes the QSA kernels out (`QSA_ATTN_D` in `qsa-attn.cu`, the compact path's 256-cell padding in
+   `llama_qsa_compact_width`); the dense fallback still runs.
+2. Memory on one card: the weights, the F16 cache above, the indexer cache, the PLE table in host RAM (26.9 GiB on
+   Flash-Next; AgentK's 32 GB holds a 15 GiB prompt cache and 10 GB of checkpoints today), the expert cache if the
+   model is a mixture (`-ncmoe`, upstream's `llama_moe_cache`: not in this tree).
+3. The GPU halves of `test-qsa-compact` and `test-qsa-select` on the V100, then `test-backend-ops -o FLASH_ATTN_EXT`
+   with the line's shapes (24 heads over 2, F16 cache, mask) on the generic Volta kernels.
+4. A conversation past 8k with `-ctk f16 -ctv f16 --kv-unified --parallel 4`: the hybrid-idx memory under the fork's
+   cell placement, packing and prompt cache (sections 6, 14, 16; `llama-kv-cache.cpp` already keeps the indexer's
+   ext through a save), a slot's save and restore, a checkpoint resume.
+5. The MTP draft: acceptance in the log with rejection sampling at draft temperature 1.0 (unchanged), the serial
+   draft loop (the chain is qwen35-only and says so), `--spec-draft-n-max 2` as upstream served it, the 65,536-id
+   subset taken by default.
+6. The upstream fixes to `qwen4exp` after b11030 that this tree does not carry, by hand if they matter (our file is
+   2,131 lines against upstream's 1,514 and no longer merges): the conv-state tail written without a copy
+   (ggml-org 749db7f0), the QSA selection built without the KQ mask (5c311426, 27b7a8a0), the layer inputs for
+   DFlash drafters (d9ee007a), the KV shift (6023692b; this fork never shifts), the MTP hidden state saved with a
+   slot (0f35d6d7), and tensors merged at convert time (2280f0fd: our loader expects them unmerged, so a GGUF made
+   by a newer upstream converter will not load here).
+7. The one-time route lines of `TAG_QWEN4_ROUTES` are printed for any Volta attention call outside the 27B's shape,
+   the vision projector's included: one line each, once a process.
+
+Launch, when the files are in place: `PHASE=mtp KV_TYPE=f16 DRAFT_N_MAX=2 MODEL_DIR=<dir> MODEL_FILE=<model.gguf>
+MTP_FILE=<mtp.gguf> ./run-superfast.sh` (the `dflash` phase needs a DFlash2 draft, which the line does not have;
+`KV_TYPE=q8_0` would be replaced by F16 with the warning above).

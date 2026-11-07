@@ -277,6 +277,7 @@ LLAMA_DFLASH2_HEAD_FILE=models/mtp-Qwen3.8-27B-Q4_0.gguf LLAMA_SPEC_DRAFT_VOCAB_
 
 - Tested only on V100 PCIe 32 GB with Qwen3.8-27B. The window and placement changes are on for the qwen35 model line
   only.
+- The Qwen4 line (Qwen3.8-Flash-Next, GGUF architecture `qwen4exp`) is supported untested: it builds, loads and drafts with its own MTP head by default, but no weights of it have run on this fork ([Â§29](CHANGES.md#29-the-qwen4-line-qwen38-flash-next-qwen4exp-on-this-fork-blind)).
 - Combined decode tops out near 130–160 tok/s with four slots: a verify step costs about the same up to 8 rows, so the
   slots share 16 verify rows a step ([§12](CHANGES.md#12-four-slots-the-verify-rows-budgeted-the-draft-one-width-at-a-time)), and each slot drafts less when more generate.
 - Four slots at 262,144 tokens (the model's training context) use ~32.3 GB of the card's 32.5 under BetterBench. The

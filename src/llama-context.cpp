@@ -6899,6 +6899,26 @@ llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    // [TAG_QWEN4_KV] the qwen4exp line's sparse attention reads its cache in F16 or BF16 only: the block-sparse prompt
+    // kernel (ggml-cuda/qsa-attn.cu) and the compact selected-KV decode path (models/qwen4exp-qsa-compact.h) both
+    // refuse a quantized K/V, which would leave every QSA layer on the whole-cache dense attention with an F16 widening
+    // of the cache per call. The 27B's Q8_0 routes (CHANGES.md section 1) are built for its 6-head shape and do not
+    // apply, so a quantized type is replaced by F16 and said so; LLAMA_QWEN4EXP_KV_QUANT=1 keeps the requested types
+    if (model->arch == LLM_ARCH_QWEN4EXP && (ggml_is_quantized(params.type_k) || ggml_is_quantized(params.type_v))) {
+        const char * e = getenv("LLAMA_QWEN4EXP_KV_QUANT");
+        if (e != nullptr && atoi(e) != 0) {
+            LLAMA_LOG_WARN("%s: qwen4exp with a quantized K/V cache (%s/%s): the QSA sparse paths read F16/BF16 only, every "
+                    "QSA layer attends densely over the whole cache (LLAMA_QWEN4EXP_KV_QUANT=1)\n",
+                    __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        } else {
+            LLAMA_LOG_WARN("%s: qwen4exp: K/V cache types %s/%s replaced by f16/f16: the QSA sparse paths read F16/BF16 only "
+                    "(LLAMA_QWEN4EXP_KV_QUANT=1 keeps the requested types)\n",
+                    __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+            params.type_k = GGML_TYPE_F16;
+            params.type_v = GGML_TYPE_F16;
+        }
+    }
+
     if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);

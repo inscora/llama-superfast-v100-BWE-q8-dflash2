@@ -3,6 +3,8 @@
 #include "fattn-common.cuh"
 #include "fattn-verify-stream.cuh"
 
+#include <atomic>
+
 // The verify and draft-step call (1 to 8 tokens, a GQA group of 6, D = 256) over an F16 cache of at least LLAMA_FATTN_VERIFY_STREAM keys
 // (default 4096; -1 or 0: off, the mma routes are then used). And 9 to 16 tokens (two slots'
 // verify), as pairs of 8-token blocks over the same K/V stream (LLAMA_FATTN_VERIFY_STREAM_W16=0: 1 to 8 only, as before). And over
@@ -70,6 +72,16 @@ bool ggml_cuda_fattn_verify_stream_applies(const ggml_tensor * dst, int device) 
     const bool kv_q8 = fvs_q8() && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
     if (Q->type != GGML_TYPE_F32 || !((K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) || kv_q8) || !mask ||
             mask->type != GGML_TYPE_F16) {
+        return false;
+    }
+    // [TAG_QWEN4_ROUTES] a head configuration the kernel is not built for is said once; the generic kernels serve it from then on
+    if (K->ne[2] != 0 && (Q->ne[0] != fvs::D || Q->ne[2] != 6*K->ne[2])) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) {
+            GGML_LOG_WARN("fattn: the streaming verify kernel (LLAMA_FATTN_VERIFY_STREAM): not taken for head dimension %lld with %lld query heads per KV head "
+                          "(the kernel streams 6 heads of %d); the generic Volta kernels serve this shape\n",
+                          (long long) Q->ne[0], (long long) (Q->ne[2] / K->ne[2]), fvs::D);
+        }
         return false;
     }
     const int max_tok = fvs_max_tok();

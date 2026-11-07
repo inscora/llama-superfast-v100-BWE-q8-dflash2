@@ -539,7 +539,8 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_INKLING:
-        case LLM_ARCH_QWEN4EXP:
+        // qwen4exp is not here: a file with no experts loads the dense SwiGLU ([TAG_QWEN4_DENSE], src/models/qwen4exp.cpp),
+        // so the dense variant is generated and run beside the MoE one
         case LLM_ARCH_PHIMOE:
         case LLM_ARCH_DBRX:
         case LLM_ARCH_OLMOE:
@@ -600,6 +601,7 @@ static bool moe_implemented(const llm_arch arch) {
         case LLM_ARCH_GRANITE_MOE:
         case LLM_ARCH_MISTRAL3:
         case LLM_ARCH_LLAMA_EMBED:
+        case LLM_ARCH_QWEN4EXP:  // both variants: the MoE of the published model, the dense of [TAG_QWEN4_DENSE]
             return true;
         default:
             return false;

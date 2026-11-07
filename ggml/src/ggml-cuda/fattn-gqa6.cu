@@ -993,6 +993,17 @@ bool ggml_cuda_fattn_gqa6_applies(const ggml_tensor* dst) {
   if (Q->type != GGML_TYPE_F32 || !(kv_f16 || kv_q8) || dst->type != GGML_TYPE_F32) {
     return false;
   }
+  // [TAG_QWEN4_ROUTES] a head configuration the route is not built for (the head dimension, the query heads per KV head:
+  // the qwen4exp line's QSA layers have 12 per KV head) is said once; the generic Volta kernels serve it from then on
+  if (K->ne[2] != 0 && (Q->ne[0] != kHeadDim || Q->ne[2] != kQPerKV * K->ne[2])) {
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true)) {
+      GGML_LOG_WARN("fattn: 6-head prompt attention (LLAMA_FA_GQA6): not taken for head dimension %lld with %lld query heads per KV head "
+                    "(the route packs %d heads of %d); the generic Volta kernels serve this shape\n",
+                    (long long) Q->ne[0], (long long) (Q->ne[2] / K->ne[2]), kQPerKV, kHeadDim);
+    }
+    return false;
+  }
   if (Q->ne[0] != kHeadDim || K->ne[0] != kHeadDim || V->ne[0] != kHeadDim || K->ne[2] == 0 || Q->ne[2] != kQPerKV * K->ne[2] ||
       V->ne[2] != K->ne[2] || V->ne[1] != K->ne[1] || Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1) {
     return false;
