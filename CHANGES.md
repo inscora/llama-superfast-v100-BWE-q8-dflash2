@@ -685,6 +685,13 @@ morning): 128,009 tokens in 203.5 s (629 tok/s; rsZ 205.8 s, 622), 243,576 token
 earlier points (818 tok/s at 64k, 538 at 180k, 505-509 at 200k): the cap changes nothing on a cold prefill, which runs
 in 2,048-row chunks on gqa6 either way.
 
+The same two prefills with the card's 200 W power limit removed (2026-11-08, rsAB, the card at its 250 W board rating
+under a new fan at full speed; `pf2u.sh`, the same fresh-container method): 128,009 tokens in 183.9 s (696 tok/s, +11%),
+243,576 in 472.4 s (516 tok/s, +12%). The card drew 231-233 W on average through them, sat at the board limit on
+25-33% of the 2-second samples (peaks 265-279 W), and topped out at 62-64 C, against 72 C under the old fan at 200 W.
+Deep prefill is now bound by the board's own power limit, not by a cap; BetterBench's 1.5k-47k prefills gained 8-10%
+the same way and its decode did not move (it draws about 180 W).
+
 ## 28. The attention's structure at depth (branch attn-depth)
 
 The question from section 27: with the attention at 61% of a 174k prefill and 70% at 244k, and the gqa6 route at 42

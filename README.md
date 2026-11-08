@@ -93,8 +93,8 @@ instead of 12 s. The 262,144-token pool peaks at ~32.3 GB of the card's 32.5 in 
 
 What the bench does not show, because its conversations are short and never return:
 
-- **Prompts far past the bench's 47k.** A 128k-token prompt is read cold at 629 tok/s and a 244k one, the most a
-  slot holds, at 459 tok/s (both measured before the power limit was lifted), the attention at depth running on tensor cores
+- **Prompts far past the bench's 47k.** A 128k-token prompt is read cold at 696 tok/s and a 244k one, the most a
+  slot holds, at 516 tok/s, the attention at depth running on tensor cores
   ([§27](CHANGES.md#27-the-streaming-kernel-takes-prompts-of-up-to-64-tokens), [§28](CHANGES.md#28-the-attentions-structure-at-depth-branch-attn-depth)).
 
 - **A side prompt beside a generating slot.** Upstream's two-user scheduler refuses DFlash2 prompt jobs, so a side
