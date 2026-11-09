@@ -5974,7 +5974,16 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        // [TAG_SPEC_PROMPT_LAZY] the slot's tokens are copied for the draft only when something reads the
+                        // copy: an ngram drafter or the lookup. A draft model (DFlash2, MTP) never does, and the copy is
+                        // every token of the conversation, every round (0.1 ms at 100k tokens, 0.3 ms at 244k).
+                        // LLAMA_SPEC_PROMPT_COPY=1 copies every round, as before
+                        static const bool spec_prompt_copy = [] { const char * e = getenv("LLAMA_SPEC_PROMPT_COPY"); return e != nullptr && atoi(e) != 0; }();
+                        if (spec_prompt_copy || lookup_on() || common_speculative_needs_prompt(spec.get())) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        } else if (!slot.spec_prompt.empty()) {
+                            slot.spec_prompt.clear(); // not a stale copy
+                        }
 
                         // [TAG_SPEC_ADAPT_WIDTH] the narrow width, or no cap
                         const int32_t ada_full = common_speculative_n_max(spec.get());
@@ -7079,10 +7088,25 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // [TAG_SPEC_PROCESS_EARLY] the drafter's processing of this batch (DFlash2: the injection of the rows' target
+        // features into its cache) is issued in the same yield, between the target's decode and its synchronize, instead
+        // of in a yield of its own after it. It reads nothing the synchronize delivers: on the device path the feature
+        // rows are copied on the target's stream, behind its graph, and the drafter's stream waits on that copy's event
+        // (ggml_backend_cuda_cpy_tensor_async); on the host path llama_get_embeddings_layer_inp synchronizes itself. So
+        // the injection is queued when the verify graph ends, not a queue hand-off, the metrics and the injection's host
+        // preparation later, with the GPU idle meanwhile. DFlash drafters only (common_speculative_process_early_ok).
+        // LLAMA_SPEC_PROCESS_EARLY=0 restores the two yields; the
+        // scheduler's diagnostic (LLAMA_TU_DIAG) keeps them, since it hashes the target's rows between the two
+        static const bool spec_process_early_env = [] { const char * e = getenv("LLAMA_SPEC_PROCESS_EARLY"); return e == nullptr || atoi(e) != 0; }();
+        const bool spec_process_early = spec_process_early_env && spec && !tu_policy.diag && common_speculative_process_early_ok(spec.get());
+        bool spec_process_ok = true;
         {
             GGML_RT_SCOPE("srv.decode_yield");
             queue_tasks.yield_to_queue([&]() {
                 ret = llama_decode(ctx_tgt, batch_view);
+                if (ret == 0 && spec_process_early) {
+                    spec_process_ok = common_speculative_process(spec.get(), batch_view);
+                }
                 if (ret == 0 && has_output) {
                     llama_synchronize(ctx_tgt);
                 }
@@ -7149,8 +7173,8 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
-            bool ok = true;
-            {
+            bool ok = spec_process_ok; // [TAG_SPEC_PROCESS_EARLY] already issued with the decode
+            if (!spec_process_early) {
                 GGML_RT_SCOPE("srv.process_yield");
                 queue_tasks.yield_to_queue([&]() {
                     ok = common_speculative_process(spec.get(), batch_view);
@@ -7330,7 +7354,16 @@ private:
             // verify and try to accept the draft
             GGML_RT_SCOPE("srv.accept_block");
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // [TAG_SPEC_SAVE_LAZY] the sampler's saved copy is only read when a partial acceptance restores the
+                // checkpoint, which takes a rollback deeper than the context supports: at most n_draft tokens roll back,
+                // so a draft within the rollback depth (every round with a recurrent target at n-max <= depth) never
+                // reads it. The clone copies the grammar's rules and its trigger buffer. LLAMA_SPEC_SMPL_SAVE=1 clones
+                // every round, as before
+                static const bool smpl_save_always = [] { const char * e = getenv("LLAMA_SPEC_SMPL_SAVE"); return e != nullptr && atoi(e) != 0; }();
+                const bool may_restore_ckpt =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > rs_depth(slot));
+                common_sampler_ptr smpl_save(smpl_save_always || may_restore_ckpt ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 if (coupled_debug() >= 2) {
@@ -7422,6 +7455,7 @@ private:
                         common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        GGML_ASSERT(smpl_save); // n_rollback <= n_draft, so may_restore_ckpt held [TAG_SPEC_SAVE_LAZY]
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
                         return;

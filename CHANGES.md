@@ -744,3 +744,55 @@ weighted decode, 90.1 / 123.6 / 156.0 aggregate tok/s at 1 / 2 / 4 requests, pre
 16k / 64k; rsAA 101.1, 94.2 / 120.5 / 161.7, 951 / 945 / 816. Inside the spread everywhere but the 64k prefill (+1%),
 as expected: the benchmark's depths are where the attention is a small share. No errors, peak VRAM unchanged (31.9 GB).
 Adopted: main, image rsAB.
+
+## 30. Host work in the decode round (branch host-cleanups, not measured)
+
+A review of the decode round on 2026-11-09 (the card was off; section 29 is the `qwen4` branch's). The round is GPU
+bound: 94% busy, 81% of that in the weight kernels (the 2026-10-23 profile). What the host adds is small, and most of
+it hides under the drafter's injection, about 1.9 ms of GPU time issued after each verify. It shows when the host
+window is longer than that: requests with a tool list, whose sampler clones are heavy, and deep conversations. Four
+changes, each exact (the served tokens do not change) and each behind a switch that restores the previous code:
+
+- **A clone of a grammar shares its rules** (`TAG_GRAMMAR_SHARED_RULES`, `LLAMA_GRAMMAR_SHARE_RULES=0` copies). The
+  rules never change after init (upstream's own `TODO: shared ptr`). A clone copied every rule, then compared every
+  stack element with every rule element to redirect its pointers, a loop with no break: stack elements x rule
+  elements comparisons a clone. A speculative round clones the sampler twice, for the draft's rejection picks and for
+  the block verification, so with a tool list's grammar this is the bulk of the round's host time. Now the clone holds
+  the same `shared_ptr` and its copied stacks already point into it. `test-grammar-integration` gains `test_clone`
+  (a clone taken mid-input: the same stacks, its own progress, a clone of a clone, a clone outliving its source).
+- **The sampler's saved copy is cloned only when it can be read** (`TAG_SPEC_SAVE_LAZY`, `LLAMA_SPEC_SMPL_SAVE=1`
+  clones every round). The copy is read on one branch, a partial acceptance that restores the checkpoint, which needs
+  a rollback deeper than the context supports. At most n_draft tokens roll back, so with a recurrent target at an
+  n-max within the rollback depth (every production round) the branch is unreachable and the third clone of the round
+  was dead work.
+- **The slot's tokens are copied for the draft only when something reads the copy** (`TAG_SPEC_PROMPT_LAZY`,
+  `LLAMA_SPEC_PROMPT_COPY=1` copies every round). `spec_prompt` was rebuilt every round, one pass over every token of
+  the conversation; its readers are the ngram drafters and the lookup of section 25
+  (`common_speculative_needs_prompt`). A draft model keeps its own state.
+- **The drafter's injection is issued with the target's decode** (`TAG_SPEC_PROCESS_EARLY`,
+  `LLAMA_SPEC_PROCESS_EARLY=0` restores the two yields). `common_speculative_process` ran in a queue yield of its own
+  after the target's synchronize, the metrics in between: the GPU sat idle from the end of the verify graph until the
+  injection's host preparation was done. It now runs in the decode's yield, before the synchronize. It needs nothing
+  the synchronize delivers: the feature rows go device to device, copied on the target's stream behind its graph, and
+  the drafter's stream waits on that copy's event; the host path's getter synchronizes itself. DFlash drafters only
+  (`common_speculative_process_early_ok`); `LLAMA_TU_DIAG` keeps the two yields.
+
+Verified here: the CPU and CUDA servers build; `test-grammar-integration`, `test-llama-grammar`,
+`test-grammar-parser`, `test-json-schema-to-grammar`, `test-chat`, `test-chat-auto-parser`, `test-chat-peg-parser`,
+`test-chat-template`, `test-sampling`, `test-spec-rejection`, `test-spec-draft-grammar` and `test-reasoning-budget`
+pass with the defaults and with `LLAMA_GRAMMAR_SHARE_RULES=0`. Not verified: the three server-loop changes have not
+run (no GPU, and the synthetic test models carry no vocabulary for a CPU server), and nothing is timed.
+
+To do on the card, in this order: greedy outputs identical with the four switches at their defaults and restored
+(a request with tools, one without, at shallow and 100k+ context); `LLAMA_ROUND_TIMERS=1` on both, reading
+`cs.clone`, `srv.accept_block`, `spec.process` and the gap line from the target's graph to the drafter's; then the
+decode rate on a tool-calling session, which BetterBench does not exercise. Expected from the code alone: little
+without tools at shallow context, where the host window already fits under the injection; the clone change is the
+one that can be worth a millisecond or more a round, on requests with a large tool list.
+
+Left out, from the same review: the next draft launched right after the acceptance (the host work it would hide
+already runs under the injection), the forward's 96 ring `set_rows` fused into the conv-slots launch (a CUDA kernel
+change, 0.3-0.6 ms, to write with the card at hand and `LLAMA_RS_REPLAY_SELFTEST`), the graph compatibility walk
+cached per uid (20-50 us). Two findings of the review are not host work and are not in this branch: a drafted row
+loses the rejection step once a tool call's grammar has triggered (`common_sampler_rejection_row_ok`), and the
+streaming verify kernel reads a Q8_0 cache at about 306 GB/s where it reads an F16 one at 659 (section 1's numbers).
