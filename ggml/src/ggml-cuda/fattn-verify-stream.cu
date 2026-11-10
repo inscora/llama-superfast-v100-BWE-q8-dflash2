@@ -180,7 +180,24 @@ void ggml_cuda_flash_attn_ext_verify_stream(ggml_backend_cuda_context & ctx, ggm
     // [TAG_FVS_Q8_ROW1] LLAMA_FATTN_VERIFY_STREAM_Q8_ROW1=1: each Q8_0 K row read from global memory once (16-byte loads, raw
     // rows staged in shared memory); the V rows as before. Its own launch: the strip needs more shared memory
     static const int q8_row1 = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_ROW1"); return e ? atoi(e) : 0; }();
-    if (kv_q8 && q8_probe == 4) {
+    // [TAG_FVS_Q8_VB] LLAMA_FATTN_VERIFY_STREAM_Q8_VB = 2, 3 or 4: the QK warps load and widen that many eighths of each
+    // Q8_0 V tile for the PV warps (exact: the same output bit for bit). 0: off. Its own launch: the part needs more
+    // shared memory. A V row is laid out as a K row (the QK lanes read it as they read K)
+    static const int q8_vb = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_VB"); const int v = e ? atoi(e) : 0; return v >= 2 && v <= 4 ? v : 0; }();
+    if (kv_q8 && V->type == GGML_TYPE_Q8_0 && q8_vb != 0 && q8_probe == 0 && q8_ld == 0 && q8_row1 == 0 && q8_w && !q8_kp8 && K->nb[1] == V->nb[1]) {
+        constexpr int VB = 32 + 131072;
+        const auto   fn = q8_vb == 2 ? fvs::verify_stream<6, false, VB + 262144, true> :
+                          q8_vb == 3 ? fvs::verify_stream<6, false, VB +  65536, true> : fvs::verify_stream<6, false, VB, true>;
+        const size_t sm = fvs::sm_bytes_vb(q8_vb);
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, VB + 262144, true>), fvs::sm_bytes_vb(2));
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, VB +  65536, true>), fvs::sm_bytes_vb(3));
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, VB, true>),          fvs::sm_bytes_vb(4));
+        fn<<<dim3(nsplit*nkvh*nhalf, n_strm, 1), fvs::NTH, sm, stream>>>(
+            (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+            (float *) dst->data, parts.ptr, meta.ptr, n_tok, n_head, nkvh,
+            Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1], n_kv, kv_count, nsplit, scale*1.4426950408889634f, nhalf,
+            Q->nb[3], K->nb[3], V->nb[3], mask->nb[3], use_list ? tlist.ptr : nullptr, use_list ? tcount.ptr : nullptr, tstride);
+    } else if (kv_q8 && q8_probe == 4) {
         // probe 4, wrong output: part of each V tile loaded and widened by the QK warps, read as F16 by the PV warps
         // (LLAMA_FATTN_VERIFY_STREAM_Q8_HB = 3, 4 or 5 eighths of the tile; 4 by default)
         static const int hb = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_HB"); return e ? atoi(e) : 4; }();

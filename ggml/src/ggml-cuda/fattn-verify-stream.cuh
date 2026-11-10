@@ -61,6 +61,8 @@ constexpr size_t SM_BYTES = SM_KR + 4*16*272;
 constexpr size_t SM_BYTES_V = SM_KR + 4*64*80;
 // probe (VAR & 16384): half a V tile as F16 (32 rows), widened by the QK warps
 constexpr size_t SM_BYTES_HB = SM_KR + 40*KST*sizeof(half);   // up to 40 rows (5/8 of a tile)
+// [TAG_FVS_Q8_VB] the first c eighths of a V tile (8*c rows) as F16, widened by the QK warps
+constexpr size_t sm_bytes_vb(const int c) { return SM_KR + (size_t) 8*c*KST*sizeof(half); }
 
 static __device__ __forceinline__ void mma_rc(float (&c)[8], const uint32_t a0, const uint32_t a1, const uint32_t b0, const uint32_t b1) {
     asm("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};"
@@ -277,8 +279,18 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
     static_assert(!Q8R || KP == 0, "the staged K rows are loaded by the QK warps");
     constexpr int  Q8PK = (VAR & 2048) != 0 ? 0 : Q8P;   // VAR & 2048: the probes on the V loads only (K as usual)
     constexpr bool Q8RV = KVQ8 && (VAR & 8192) != 0;    // VAR & 8192: each V row's bytes read from global memory once ([TAG_FVS_Q8_ROW1V])
-    constexpr bool Q8HB = KVQ8 && (VAR & 16384) != 0;   // VAR & 16384: timing probe, wrong output: the QK warps load and widen half of each V tile into shared memory, the PV warps read it as F16
-    constexpr int  HBC  = (VAR & 32768) != 0 ? 5 : (VAR & 65536) != 0 ? 3 : 4;   // the probe's share of a V tile, in eighths
+    // [TAG_FVS_Q8_VB] VAR & 131072: the widening of a Q8_0 V tile shared between the groups. The PV warps set the kernel's
+    // pace on Q8_0 (their product loop carries the V loads and the widening; the QK warps finish their tile early), so
+    // the QK warps load and widen the first HBC eighths of each V tile (rows 0 .. 8*HBC - 1, all 256 dims: a lane takes
+    // the 8 dims it takes of a K row) into shared memory as F16, and the PV warps read those rows as fragments with one
+    // load each and widen only the rest themselves. The same raw words through the same to_f16x8, in the same product
+    // order: the same output bit for bit. The part is single-buffered. A PV warp consumes tile j - 1's part first in
+    // iteration j, then arrives at barrier 3; a QK warp, once its P of tile j is written, waits at barrier 3 for the
+    // four PV warps, lays down tile j's part (in its registers since the iteration before) and requests tile j + 1's
+    constexpr bool Q8VX = KVQ8 && (VAR & 131072) != 0;
+    static_assert(!Q8VX || (KP == 0 && (VAR & (768 | 1024 | 4096 | 8192 | 16384)) == 0), "the shared V widening goes with the plain Q8_0 loads");
+    constexpr bool Q8HB = KVQ8 && (VAR & (16384 | 131072)) != 0;   // VAR & 16384: the timing probe of the above, wrong output (the part one tile early, no barrier)
+    constexpr int  HBC  = (VAR & 32768) != 0 ? 5 : (VAR & 65536) != 0 ? 3 : (VAR & 262144) != 0 ? 2 : 4;   // the QK warps' share of a V tile, in eighths
     constexpr bool Q8VS = KVQ8 && (VAR & 4096) != 0;    // VAR & 4096: probe, wrong output: a V lane's load as one global word and three shared-memory reads
 
     // this block's 8-token half; Q, the mask and the outputs from its first token on
@@ -384,7 +396,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                 const char * kp = Kbase + (key + w)*nbk1 + kofs;
 #pragma unroll
                 for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = (Q8X ? ld_row8c<Q8SD>(kp, kld) : ld_row8<KVQ8, Q8W, Q8PK>(kp, kq));
-                if constexpr (Q8HB) {
+                if constexpr (Q8HB && !Q8VX) {
                     const char * xp = V + kvh*nbv2 + (key + w)*nbv1 + kofs;
 #pragma unroll
                     for (int rr = 0; rr < 2*HBC; ++rr, xp += 4*nbv1) kx[rr] = ld_row8<KVQ8, Q8W, 0>(xp, kq);
@@ -406,12 +418,23 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
             } else {
 #pragma unroll
                 for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8, Q8PK>(kreg[rr]);
-                if constexpr (Q8HB) {
+                if constexpr (Q8HB && !Q8VX) {
                     half * vf = (half *)(smem_raw + SM_KR);
 #pragma unroll
                     for (int rr = 0; rr < 2*HBC; ++rr) *(uint4 *) &vf[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8, 0>(kx[rr]);
                 }
             }
+        };
+        // [TAG_FVS_Q8_VB] the QK warps' part of the V tile at key: rows w, w + 4, .. of its first 8*HBC, this lane's 8 dims
+        const auto x_load = [&](const int64_t key) {
+            const char * xp = V + kvh*nbv2 + (key + w)*nbv1 + kofs;
+#pragma unroll
+            for (int rr = 0; rr < 2*HBC; ++rr, xp += 4*nbv1) kx[rr] = ld_row8<KVQ8, Q8W, 0>(xp, kq);
+        };
+        const auto x_store = [&]() {
+            half * vf = (half *)(smem_raw + SM_KR);
+#pragma unroll
+            for (int rr = 0; rr < 2*HBC; ++rr) *(uint4 *) &vf[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8, 0>(kx[rr]);
         };
         float mrun[3][4], lrun[3][4];
 #pragma unroll
@@ -425,6 +448,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                 k_load(key0(1));
             }
         }
+        if constexpr (Q8VX) { if (nt > 0) x_load(key0(0)); }
         __syncthreads();
 
         for (int j = 0; j <= nt; ++j) {
@@ -545,6 +569,13 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                         k_load(key0(j + 2));
                     }
                 }
+                if constexpr (Q8VX) {
+                    asm volatile("bar.sync 3, 256;" ::: "memory");   // every PV warp is done reading the part of tile j - 1
+                    x_store();                                        // tile j's part, read by the PV warps in iteration j + 1
+                    if (j + 1 < nt) {
+                        x_load(key0(j + 1));
+                    }
+                }
             }
             __syncthreads();
         }
@@ -638,9 +669,10 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
             if constexpr (Q8RV) {
                 vt_load(key0(0));
             } else {
-                const char * vp = Vbase + key0(0)*nbv1;
+                constexpr int q0 = Q8VX ? 2*HBC : 0;   // [TAG_FVS_Q8_VB] the rows before q0 come from the QK warps
+                const char * vp = Vbase + (key0(0) + 4*q0)*nbv1;
 #pragma unroll
-                for (int q = 0; q < 16; ++q, vp += 4*nbv1) vreg[q] = v_load(vp);
+                for (int q = q0; q < 16; ++q, vp += 4*nbv1) vreg[q] = v_load(vp);
             }
         }
         if constexpr (KP > 0) {   // the PV group owns the last KP rows of the K tile's load and its store to shared memory
@@ -663,6 +695,8 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
         __syncthreads();
 
         for (int j = 0; j <= nt; ++j) {
+            // [TAG_FVS_Q8_VB] nothing of the part is read in iteration 0: the QK warps may lay down tile 0's
+            if constexpr (Q8VX) { if (j == 0 && nt > 0) asm volatile("bar.arrive 3, 256;" ::: "memory"); }
             if (j >= 1) {
                 const int b = (j - 1) & 1;
                 const half * Prow = s.P[b] + (l4 + 4*hi)*PST;
@@ -693,6 +727,8 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
 #pragma unroll
                 for (int c = 0; c < TK/8; ++c) {
                     uint4 v0, v1;
+                    // [TAG_FVS_Q8_VB] this warp has read its fragments of the QK warps' part (chunks 0 .. HBC - 1)
+                    if constexpr (Q8VX) { if (c == HBC && j < nt) asm volatile("bar.arrive 3, 256;" ::: "memory"); }
                     if constexpr (Q8RV) {
                         v0 = to_f16x8<KVQ8, Q8P>(vt_row(l4 + 8*c));
                         v1 = to_f16x8<KVQ8, Q8P>(vt_row(l4 + 8*c + 4));
@@ -718,6 +754,8 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                         mma_cc(O[1][t], v1.z, v1.w, pf.z, pf.w);
                     }
                 }
+#else
+                if constexpr (Q8VX) { if (j < nt) asm volatile("bar.arrive 3, 256;" ::: "memory"); }
 #endif
             }
             if constexpr (KP > 0) {
