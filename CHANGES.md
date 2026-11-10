@@ -745,7 +745,7 @@ weighted decode, 90.1 / 123.6 / 156.0 aggregate tok/s at 1 / 2 / 4 requests, pre
 as expected: the benchmark's depths are where the attention is a small share. No errors, peak VRAM unchanged (31.9 GB).
 Adopted: main, image rsAB.
 
-## 30. Host work in the decode round (branch host-cleanups, not measured)
+## 30. Host work in the decode round (branch host-cleanups; measured 2026-11-09: +0.4 to +0.8%, outputs identical)
 
 A review of the decode round on 2026-11-09 (the card was off; section 29 is the `qwen4` branch's). The round is GPU
 bound: 94% busy, 81% of that in the weight kernels (the 2026-10-23 profile). What the host adds is small, and most of
@@ -756,8 +756,8 @@ changes, each exact (the served tokens do not change) and each behind a switch t
 - **A clone of a grammar shares its rules** (`TAG_GRAMMAR_SHARED_RULES`, `LLAMA_GRAMMAR_SHARE_RULES=0` copies). The
   rules never change after init (upstream's own `TODO: shared ptr`). A clone copied every rule, then compared every
   stack element with every rule element to redirect its pointers, a loop with no break: stack elements x rule
-  elements comparisons a clone. A speculative round clones the sampler twice, for the draft's rejection picks and for
-  the block verification, so with a tool list's grammar this is the bulk of the round's host time. Now the clone holds
+  elements comparisons a clone. A speculative round clones the sampler for the draft's rejection picks and for the
+  block verification. Now the clone holds
   the same `shared_ptr` and its copied stacks already point into it. `test-grammar-integration` gains `test_clone`
   (a clone taken mid-input: the same stacks, its own progress, a clone of a clone, a clone outliving its source).
 - **The sampler's saved copy is cloned only when it can be read** (`TAG_SPEC_SAVE_LAZY`, `LLAMA_SPEC_SMPL_SAVE=1`
@@ -780,15 +780,36 @@ changes, each exact (the served tokens do not change) and each behind a switch t
 Verified here: the CPU and CUDA servers build; `test-grammar-integration`, `test-llama-grammar`,
 `test-grammar-parser`, `test-json-schema-to-grammar`, `test-chat`, `test-chat-auto-parser`, `test-chat-peg-parser`,
 `test-chat-template`, `test-sampling`, `test-spec-rejection`, `test-spec-draft-grammar` and `test-reasoning-budget`
-pass with the defaults and with `LLAMA_GRAMMAR_SHARE_RULES=0`. Not verified: the three server-loop changes have not
-run (no GPU, and the synthetic test models carry no vocabulary for a CPU server), and nothing is timed.
+pass with the defaults and with `LLAMA_GRAMMAR_SHARE_RULES=0`.
 
-To do on the card, in this order: greedy outputs identical with the four switches at their defaults and restored
-(a request with tools, one without, at shallow and 100k+ context); `LLAMA_ROUND_TIMERS=1` on both, reading
-`cs.clone`, `srv.accept_block`, `spec.process` and the gap line from the target's graph to the drafter's; then the
-decode rate on a tool-calling session, which BetterBench does not exercise. Expected from the code alone: little
-without tools at shallow context, where the host window already fits under the injection; the clone change is the
-one that can be worth a millisecond or more a round, on requests with a large tool list.
+Measured on the card on 2026-11-09 (the V100 uncapped, production's launcher settings, `~/src/q8bench/hc.sh`,
+results in `results/hc/`). The probe `hcprobe.py` sends 21 fixed requests on one slot, each at temperature 0 or at
+temperature 1.0 with a fixed seed: plain chat, a five-turn agent loop with a 14-tool list, a JSON schema, a 1,400-token
+file written through a tool call, and a 99,645-token conversation with a verbatim copy, a tool-call write and prose
+on top. Three servers ran it with the round timers on: this build with the switches at their defaults (new), this
+build with the four switches restored (old), and the previous build.
+
+- Outputs: all 21 requests are identical, character for character, across the three, and across six more passes
+  without timers (new and old alternating, three each). No assert or CUDA error in any log; 65 C at most.
+- Round time, new against old, microseconds of host round on the same rounds (the outputs being identical, the two
+  ran the same rounds): plain chat 41,185 -> 41,026 (-0.4%), the agent loop 42,390 -> 42,050 (-0.8%), the tool-call
+  write 42,050 -> 41,740 (-0.75%), the JSON schema 48,370 -> 47,380 (-2.0%), 100k deep 51,640 -> 51,230 (-0.8%).
+  GPU busy time is unchanged; the idle time between graphs falls by 0.2 to 0.6 ms a round. The old code and the
+  previous build agree within 0.1% on every request: the switches do restore it.
+- Decode rate over the alternating passes (three each, ranges that do not overlap on any request but each
+  server's first): plain +0.4%, the agent loop +0.7%, the tool-call write +0.7% (142.6 against 141.6 tok/s), the JSON
+  schema +2.1% (90.9 against 89.0).
+- Where it comes from. Sampler clones a round: 3 -> 2 without a grammar, 2 -> 1 with one. A clone with the 14-tool
+  grammar costs 20 us instead of 60 (`cs.clone` 120 -> 20 us a round); with the schema's grammar about 530 us
+  either way, because there the stacks are the cost, not the rules. The early injection does not overlap the verify:
+  the drafter's decode synchronizes its own stream while it prepares, and that stream waits on the copy behind the
+  target's graph, so `spec.process` now blocks for the verify's 34 ms and the synchronize after it finds the work
+  done. What it saves is the hand-off: the gap from the target's graph to the drafter's injection falls from
+  286-311 us to 102-106 us a round on every request. The gap from the injection to the draft falls with the clones
+  (357 -> 280 us in the tool-call write) and, at 100k, with the token copy (556 -> 355 us).
+- Seen on the way, not part of this branch: with the JSON schema (an array of exactly 12 objects) the grammar work
+  of a round takes 6.3 to 7 ms (`srv.accept_block`), against 0.3 ms inside a tool call's body, and the round's idle
+  time is 9 ms against 2. Acceptance in the tool-call bodies was 70% shallow and 80% at 100k.
 
 Left out, from the same review: the next draft launched right after the acceptance (the host work it would hide
 already runs under the injection), the forward's 96 ring `set_rows` fused into the conv-slots launch (a CUDA kernel
