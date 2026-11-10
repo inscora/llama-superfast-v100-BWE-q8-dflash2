@@ -270,6 +270,11 @@ struct common_sampler {
     uint64_t n_topk_rows = 0;
     uint64_t n_topk_full = 0;
 
+    // [TAG_SPEC_REJECTION_GRAMMAR] rows read through the grammar for the rejection step, and those with a candidate
+    // that does not fit it
+    uint64_t n_rej_grmr_rows  = 0;
+    uint64_t n_rej_grmr_unfit = 0;
+
     // LLAMA_BACKEND_TOPK_CHECK: 1 also samples every candidate row from the full logits with a clone of the chain and
     // compares the two, 2 always uses the full logits (the fallback path)
     static int backend_topk_check() {
@@ -883,6 +888,11 @@ void common_sampler_backend_topk_stats(const struct common_sampler * gsmpl, uint
     *n_full = gsmpl ? gsmpl->n_topk_full : 0;
 }
 
+void common_sampler_rejection_grammar_stats(const struct common_sampler * gsmpl, uint64_t * n_rows, uint64_t * n_unfit) {
+    *n_rows  = gsmpl ? gsmpl->n_rej_grmr_rows  : 0;
+    *n_unfit = gsmpl ? gsmpl->n_rej_grmr_unfit : 0;
+}
+
 static void common_sampler_backend_topk_compare(common_sampler * gsmpl, llama_sampler * chain_ref, llama_context * ctx, int idx) {
     static uint64_t n_checked = 0;
     static uint64_t n_bad     = 0;
@@ -1152,8 +1162,81 @@ void common_sampler_accept_draft(struct common_sampler * gsmpl, llama_token toke
 
 // the row can take the rejection step: no reasoning budget forcing its end sequence, and no grammar that applies
 // (a lazy grammar awaiting its trigger changes no row). the state is read per row, after the tokens accepted before it
+// [TAG_SPEC_REJECTION_GRAMMAR] LLAMA_SPEC_REJECTION_GRAMMAR (default 1): a row under a lazy grammar that has
+// triggered (a tool call's body) can take the step too, see common_sampler_rejection_grammar_fit. 2: under any grammar
+// that applies (a JSON schema's costs more to read than the step gains: 4% of the decode rate on a schema of 12
+// fixed objects). 0: no row under a grammar, as before. Never at temperature 0, where the step cannot gain
+static bool common_sampler_rejection_grammar(const struct common_sampler * gsmpl) {
+    static const int v = [] { const char * e = getenv("LLAMA_SPEC_REJECTION_GRAMMAR"); return e == nullptr ? 1 : atoi(e); }();
+    return v != 0 && gsmpl->params.temp > 0.0f && (v >= 2 || gsmpl->params.grammar_lazy);
+}
+
+static bool common_sampler_grammar_applies(const struct common_sampler * gsmpl) {
+    return grammar_should_apply(const_cast<common_sampler *>(gsmpl)) && !llama_sampler_grammar_awaiting_trigger(gsmpl->grmr);
+}
+
 static bool common_sampler_rejection_row_ok(const struct common_sampler * gsmpl) {
-    return gsmpl->rbudget_topk_ok() && !(grammar_should_apply(const_cast<common_sampler *>(gsmpl)) && !llama_sampler_grammar_awaiting_trigger(gsmpl->grmr));
+    return gsmpl->rbudget_topk_ok() && (!common_sampler_grammar_applies(gsmpl) || common_sampler_rejection_grammar(gsmpl));
+}
+
+// [TAG_SPEC_REJECTION_GRAMMAR] the candidates of cur_p that carry probability, through the grammar that applies.
+// common_sampler_sample draws from the chain and keeps the token when it fits the grammar; only a token that does not
+// fit sends it to the second draw, grammar first. So on a row where every candidate with probability fits, the token
+// follows the chain's distribution exactly, and that row can take the rejection step with p as it stands: this
+// returns true there. On a row with a candidate that does not fit it returns false and the row keeps the two-draw
+// sampling (the verify), or, with zero_unfit, those candidates get p = 0 and the rest is renormalized (the draft's q,
+// which may be any distribution the drafted token was drawn from): false then only when nothing fits
+static bool common_sampler_rejection_grammar_fit(struct common_sampler * gsmpl, llama_token_data_array * cur_p, bool zero_unfit) {
+    GGML_RT_SCOPE("cs.rej_grammar");
+    std::vector<llama_token_data> tmp;
+    std::vector<size_t> at;
+    tmp.reserve(cur_p->size);
+    at.reserve(cur_p->size);
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        if (cur_p->data[i].p > 0.0f) {
+            tmp.push_back(llama_token_data{ cur_p->data[i].id, 0.0f, 0.0f });
+            at.push_back(i);
+        }
+    }
+    if (tmp.empty()) {
+        return false;
+    }
+    llama_token_data_array arr = { tmp.data(), tmp.size(), -1, false };
+    llama_sampler_apply(gsmpl->grmr, &arr);
+
+    size_t n_unfit = 0;
+    double sum = 0.0;
+    for (size_t j = 0; j < tmp.size(); ++j) {
+        GGML_ASSERT(tmp[j].id == cur_p->data[at[j]].id && "the grammar reordered the candidates");
+        if (tmp[j].logit == -INFINITY) {
+            n_unfit++;
+            if (zero_unfit) {
+                cur_p->data[at[j]].p = 0.0f;
+            }
+        } else {
+            sum += cur_p->data[at[j]].p;
+        }
+    }
+    gsmpl->n_rej_grmr_rows++;
+    if (n_unfit == 0) {
+        return true;
+    }
+    gsmpl->n_rej_grmr_unfit++;
+    if (!zero_unfit || sum <= 0.0) {
+        return false;
+    }
+    for (size_t j = 0; j < tmp.size(); ++j) {
+        cur_p->data[at[j]].p = (float) (cur_p->data[at[j]].p / sum);
+    }
+    return true;
+}
+
+// whether one token fits the grammar that applies (the single-token check of common_sampler_sample)
+static bool common_sampler_grammar_fits(struct common_sampler * gsmpl, llama_token token) {
+    llama_token_data       one   = { token, 1.0f, 0.0f };
+    llama_token_data_array one_p = { &one, 1, -1, false };
+    llama_sampler_apply(gsmpl->grmr, &one_p);
+    return one.logit != -INFINITY;
 }
 
 // cur_p through every sampler of the chain but its final dist, then (temp > 0, and the chain's own temperature
@@ -1241,6 +1324,10 @@ llama_token common_sampler_rejection_draft(struct common_sampler * copy, struct 
 
     double u = 0.0;
     if (!common_sampler_rejection_probs(copy, &cur_p, temp)) {
+        return LLAMA_TOKEN_NULL;
+    }
+    // [TAG_SPEC_REJECTION_GRAMMAR] under a grammar that applies, q is the candidates that fit it
+    if (common_sampler_grammar_applies(copy) && !common_sampler_rejection_grammar_fit(copy, &cur_p, true)) {
         return LLAMA_TOKEN_NULL;
     }
     if (gen != nullptr) {
@@ -1346,7 +1433,8 @@ bool common_sampler_draw_uniform(struct common_sampler * gsmpl, double * u) {
 }
 
 bool common_sampler_rejection_row_ready(struct common_sampler * gsmpl) {
-    return common_reasoning_budget_forced_token(gsmpl->rbudget) == LLAMA_TOKEN_NULL && common_sampler_rejection_row_ok(gsmpl);
+    // the callers (MTP's device pick and its pipeline) do not read the grammar: no row under one that applies
+    return common_reasoning_budget_forced_token(gsmpl->rbudget) == LLAMA_TOKEN_NULL && gsmpl->rbudget_topk_ok() && !common_sampler_grammar_applies(gsmpl);
 }
 
 static float common_rejection_q_of(const common_rejection_q & q, llama_token id) {
@@ -1423,10 +1511,15 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 
             auto & cur_p = gsmpl->cur_p;
 
-            gsmpl->set_logits(ctx, idxs[i]);
+            // [TAG_SPEC_REJECTION_GRAMMAR] a row under a grammar that applies takes the step when every candidate
+            // with probability fits it (the chain's distribution is then the row's); the chain reads the backend's
+            // candidates there as the first draw of common_sampler_sample does. Otherwise the two draws below
+            const bool grammar = common_sampler_grammar_applies(gsmpl);
+
+            gsmpl->set_logits(ctx, idxs[i], !(grammar && common_sampler::topk_first_draw()));
             llama_sampler_apply(gsmpl->rbudget, &cur_p);
 
-            if (common_sampler_rejection_probs(gsmpl, &cur_p, 0.0f)) {
+            if (common_sampler_rejection_probs(gsmpl, &cur_p, 0.0f) && (!grammar || common_sampler_rejection_grammar_fit(gsmpl, &cur_p, false))) {
                 id = common_sampler_rejection_step(cur_p.data, cur_p.size, q[i], draft[i], draw, &accepted);
                 for (size_t k = 0; k < cur_p.size; ++k) {
                     if (cur_p.data[k].id == id) {
@@ -1559,9 +1652,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_
                 return common_sampler_sample_and_accept_n_rejection(gsmpl, ctx, idxs, draft, q, n_step, n_accepted);
             }
             auto & cur_p = copy->cur_p;
-            copy->set_logits(ctx, idxs[k]);
+            // [TAG_SPEC_REJECTION_GRAMMAR] as in the token step: a row under a grammar that applies takes part when
+            // every candidate with probability fits it, and its drafted token must fit to be accepted into the copy
+            const bool grammar = common_sampler_grammar_applies(copy.get());
+            copy->set_logits(ctx, idxs[k], !(grammar && common_sampler::topk_first_draw()));
             llama_sampler_apply(copy->rbudget, &cur_p);
-            if (!common_sampler_rejection_probs(copy.get(), &cur_p, 0.0f)) {
+            if (!common_sampler_rejection_probs(copy.get(), &cur_p, 0.0f) ||
+                    (grammar && (!common_sampler_rejection_grammar_fit(copy.get(), &cur_p, false) || !common_sampler_grammar_fits(copy.get(), draft[k])))) {
                 return common_sampler_sample_and_accept_n_rejection(gsmpl, ctx, idxs, draft, q, n_step, n_accepted);
             }
             rows[k].assign(cur_p.data, cur_p.data + cur_p.size);
@@ -1570,6 +1667,8 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_block(struct common_
         // the copy read every row: count them on the sampler, as the token step's reads are counted
         gsmpl->n_topk_rows += copy->n_topk_rows;
         gsmpl->n_topk_full += copy->n_topk_full;
+        gsmpl->n_rej_grmr_rows  += copy->n_rej_grmr_rows;
+        gsmpl->n_rej_grmr_unfit += copy->n_rej_grmr_unfit;
     }
 
     const auto draw = [&]() {

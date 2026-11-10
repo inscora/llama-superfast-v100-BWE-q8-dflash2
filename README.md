@@ -56,27 +56,28 @@ Against upstream at `403f06f`, one line each. The design, the measurements and t
 
 ## Results
 
-[BetterBench](https://github.com/bitexploder/betterbench) on one V100 PCIe 32 GB (200 W cap), Qwen3.8-27B
+[BetterBench](https://github.com/bitexploder/betterbench) on one V100 PCIe 32 GB, Qwen3.8-27B
 `UD-Q4_K_XL` with the DFlash2 draft, the same corpus for both (20 passes per category):
 
 - **Upstream**, [bitexploder/llama-superfast-v100](https://github.com/bitexploder/llama-superfast-v100) at `403f06f`:
   its f16 KV cache and recipe (`-b 4096 -ub 2048`), two slots of 49,152 tokens, with a 47k-token conversation resident
   in one of them, sampling at temperature 0.7. That is the largest two-slot context that survived the run: at 2 × 65,536 the card ran out of memory
   four minutes in, as its graph cache grew under traffic ([§5](CHANGES.md#5-a-smaller-cuda-graph-cache)). Its
-  scheduler is off (`LLAMA_TU=0`): on, its prompt jobs refuse the DFlash2 draft and long prompts fail.
+  scheduler is off (`LLAMA_TU=0`): on, its prompt jobs refuse the DFlash2 draft and long prompts fail. Its run
+  predates the card's power limit being lifted to its board rating; prefill is where that counts.
 - **This fork**: the [Run](#run) line as it serves in production, `q8_0` KV, four slots on one 262,144-token pool, the
   host prompt cache on, sampling at the server's temperature, 1.0.
 
 | BetterBench | Upstream, f16 KV, 2 × 49,152 | This fork, `q8_0` KV, 4 slots on 262,144 |
 |---|---|---|
 | Context | 2 slots of 49,152 tokens (98,304 in all) | 4 slots sharing one 262,144-token pool |
-| Time to first token, single stream (p50) | 610 ms | 197 ms |
-| Single-stream decode (weighted median)* | 108.9 tok/s at temperature 0.7 | 106.2 tok/s at temperature 1.0 |
-| Single-stream decode, median of 160 runs* | — | 112.1 tok/s |
-| Cold prefill, 1.5k / 6k / 12k / 24k / 47k-token prompts | 785 / 856 / 877 / 858 / 795 tok/s | 952 / 978 / 942 / 896 / 815 tok/s |
-| Aggregate decode, 1 / 2 / 4 requests in flight* | 90 / 101 / 89 tok/s | 89 / 112 / 155 tok/s |
-| Per-request decode, 1 / 2 / 4 requests in flight (median)* | 130 / 102 / 123 tok/s | 116 / 66 / 48 tok/s |
-| Time to first token, 1 / 2 / 4 requests in flight (p50) | 0.66 / 2.26 / 12.07 s | 0.19 / 0.31 / 0.37 s |
+| Time to first token, single stream (p50) | 610 ms | 188 ms |
+| Single-stream decode (weighted median)* | 108.9 tok/s at temperature 0.7 | 102.4 tok/s at temperature 1.0 |
+| Single-stream decode, median of 160 runs* | — | 111.0 tok/s |
+| Cold prefill, 1.5k / 6k / 12k / 24k / 47k-token prompts | 785 / 856 / 877 / 858 / 795 tok/s | 1,029 / 1,073 / 1,033 / 990 / 907 tok/s |
+| Aggregate decode, 1 / 2 / 4 requests in flight* | 90 / 101 / 89 tok/s | 90 / 122 / 161 tok/s |
+| Per-request decode, 1 / 2 / 4 requests in flight (median)* | 130 / 102 / 123 tok/s | 122 / 71 / 47 tok/s |
+| Time to first token, 1 / 2 / 4 requests in flight (p50) | 0.66 / 2.26 / 12.07 s | 0.18 / 0.29 / 0.36 s |
 | Peak VRAM | 31,044 MiB at 98,304 tokens | 32,260 MiB at 262,144 tokens (production, under agents) |
 
 \* The decode rows are not like for like: decode follows how many draft tokens are accepted, which falls as the
@@ -86,11 +87,15 @@ against 89. Prefill and the time to the first token do not depend on the tempera
 high with four requests because its two slots serve them two at a time: each decodes almost alone, after waiting up to
 12 s to start.
 
-The first token comes three times sooner, prompts are read 3–21% faster (the most for short ones), the context is 2.7×
-larger, and with four requests in flight the fork serves 1.7× the throughput, the fourth request starting in 0.4 s
+The first token comes three times sooner, prompts are read 14–31% faster (the most for short ones), the context is 2.7×
+larger, and with four requests in flight the fork serves 1.8× the throughput, the fourth request starting in 0.4 s
 instead of 12 s. The 262,144-token pool peaks at ~32.3 GB of the card's 32.5 in production under four agents.
 
 What the bench does not show, because its conversations are short and never return:
+
+- **Prompts far past the bench's 47k.** A 128k-token prompt is read cold at 696 tok/s and a 244k one, the most a
+  slot holds, at 516 tok/s, the attention at depth running on tensor cores
+  ([§27](CHANGES.md#27-the-streaming-kernel-takes-prompts-of-up-to-64-tokens), [§28](CHANGES.md#28-the-attentions-structure-at-depth-branch-attn-depth)).
 
 - **A side prompt beside a generating slot.** Upstream's two-user scheduler refuses DFlash2 prompt jobs, so a side
   request's prompt waits until the other slot finishes generating. Here it starts at once and the generating slot keeps
@@ -195,8 +200,7 @@ What the settings do:
   traffic, so size a different context from a long mixed run, not a fill test ([§5](CHANGES.md#5-a-smaller-cuda-graph-cache)).
 
 The host side of this setup — powering an OcuLink eGPU dock from a USB relay, training the PCIe link through an S3
-suspend, loading the driver with the 200 W cap, and cooling the passive card with a PWM fan driven from its
-temperature, as systemd units an inference service chains after — is published separately as
+suspend, loading the driver, and cooling the passive card with a fan, as systemd units an inference service chains after — is published separately as
 [v100-egpu-host](https://github.com/gabtremblay/v100-egpu-host), with the bill of materials.
 
 Check the startup log for `two-user scheduling (LLAMA_TU): on`, the draft model loading,

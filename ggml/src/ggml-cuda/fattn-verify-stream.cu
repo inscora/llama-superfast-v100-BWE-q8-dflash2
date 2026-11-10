@@ -17,8 +17,21 @@ static int fvs_min_keys() {
     static const int min_keys = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM"); return e ? atoi(e) : 4096; }();
     return min_keys;
 }
+// [TAG_FVS_ROWS] the most tokens a call may have for this kernel: 64 by default (CHANGES section 27), or
+// LLAMA_FATTN_VERIFY_STREAM_MAX_TOK (a multiple of 8, 8 to 64; 16 is the cap before section 27), or 8 with
+// LLAMA_FATTN_VERIFY_STREAM_W16=0. Above 16, each 8-token block streams the keys on its own, as the second block of 9-16
+// tokens does; a prompt of 17-64 tokens at depth otherwise goes to the gqa6 route, which pads its 6-heads-per-row packing
+// to 128-row tiles (7.5 TFLOPS at 17 tokens against 42 at 1024): at 172k keys 17 rows take 3.2 ms here against 9.5 there
 static int fvs_max_tok() {
-    static const int max_tok = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_W16"); return e == nullptr || atoi(e) != 0 ? 16 : 8; }();
+    static const int max_tok = [] {
+        const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_MAX_TOK");
+        if (e != nullptr && atoi(e) > 0) {
+            const int v = (atoi(e)/8)*8;
+            return v < 8 ? 8 : v > 64 ? 64 : v;
+        }
+        const char * w = getenv("LLAMA_FATTN_VERIFY_STREAM_W16");
+        return w == nullptr || atoi(w) != 0 ? 64 : 8;
+    }();
     return max_tok;
 }
 

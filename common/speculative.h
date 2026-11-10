@@ -31,6 +31,15 @@ int32_t common_speculative_n_max(const common_params_speculative * spec);
 // return the max number of draft tokens from the initialized implementations
 int32_t common_speculative_n_max(const common_speculative * spec);
 
+// [TAG_SPEC_PROMPT_LAZY] whether any initialized implementation reads common_speculative_draft_params::prompt (the
+// ngram drafters do; the draft-model ones keep their own state from begin() and accept())
+bool common_speculative_needs_prompt(const common_speculative * spec);
+
+// [TAG_SPEC_PROCESS_EARLY] whether common_speculative_process may be issued right after the target's llama_decode, before
+// its synchronize: true when every implementation is a DFlash one, whose process() takes the target's rows device to
+// device behind the target's graph, or through a getter that synchronizes
+bool common_speculative_process_early_ok(const common_speculative * spec);
+
 // validate and resolve the unconditional synthetic acceptance rates
 std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max);
 

@@ -568,3 +568,306 @@ BetterBench, same day, same launcher (aggregate decode, 1 / 2 / 4 requests; time
 | Section 21 | 91.3 / 111.8 / 158.3 tok/s | 0.31 / 0.37 s |
 | Section 23 | 89.8 / 102.5 / 137.4 tok/s | 0.33 / 0.57 s |
 | This one | 90.9 / 117.7 / 156.3 tok/s | 0.31 / 0.37 s |
+
+## 25. Two ideas from 1Cat-vLLM, measured: lookup drafting and the exponential in PV
+
+Measured on the branch 1cat-merge, then merged: the exponential in PV is on by default, lookup drafting stays off.
+
+- **Lookup drafting beside DFlash2** (`LLAMA_SPEC_LOOKUP=1`, `TAG_SPEC_LOOKUP`; after 1Cat's lookup-augmented block
+  drafting, itself from syv-ai/HyperQwen). After the draft, the request's own tokens are scanned backwards for the most
+  recent earlier occurrence of their last 6 to 12 tokens. A strong match (8 or more) proposes what followed it: the
+  drafter's rows that agree stay, the continuation takes over from the first disagreement or past the drafter's last
+  token, up to the drafter's width (`LLAMA_SPEC_LOOKUP_WIDE` can ask for more when the slot generates alone, within its
+  rollback depth, which caps it at 7 here). A replaced position carries a one-token draft distribution, so the rejection
+  and block steps keep the target's output distribution. On a verbatim copy of a 1.6k-token file at temperature 1.0
+  (`copy_probe.py`): DFlash2 alone 158 tok/s at 82% acceptance; with lookup 145 tok/s at 72%. DFlash2 stops drafting
+  where its confidence drops, the lookup fills those rows, and a one-token row is accepted only with the target's
+  probability for its token, where a calibrated row that agrees with the target is accepted with probability ~1. The
+  extra rows cost verify time and add no accepted tokens. HyperQwen's +47% on copies was measured greedy, where a
+  one-token row is exact.
+- **The exponential in PV** (`TAG_GQA6_EXP_PV`, on by default, `LLAMA_FA_GQA6_EXP_PV=0` puts it back in the epilogue; after 1Cat's sm70_79t prefill kernel, which
+  stores FP16 logits in its QK epilogue and applies the exponential as PV loads). The QK epilogue stores
+  (logit - tile max) * log2(e) as FP16 and no sum; PV's A transform takes exp2 and accumulates each row's mass, folded
+  into the running sum after PV. 152 attention cases pass. Prompt attention on the Q8_0 cache: +1.2% at 1,024 and
+  2,048-token appends (41.4 -> 41.9 TFLOPS at 168k keys), -2.5% at 17 tokens. The epilogue's exponential and sum were
+  not the limit of the QK kernel.
+
+BetterBench (temperature 1.0, the production launcher), against the section 24 build the same day:
+
+| build | weighted decode | aggregate t/s at 1 / 2 / 4 requests | TTFT p50 (1 / 2 / 4) | acceptance |
+|---|--:|--:|--:|--:|
+| section 24 build (reference, rsT run; rsW ran only the concurrency part) | 102.7 | 91.3 / 111.8 / 158.3 (rsW: 90.9 / 117.7 / 156.3) | 0.19 / 0.31 / 0.37 s | 46.7% |
+| exponential in PV | 104.3 | 91.5 / 122.3 / 155.3 | 0.19 / 0.30 / 0.37 s | 47.5% |
+| lookup drafting | 101.4 | 88.1 / 106.0 / 154.3 | 0.19 / 0.31 / 0.37 s | 46.4% |
+| both | 103.0 | 89.5 / 118.7 / 153.8 | 0.19 / 0.30 / 0.37 s | 46.4% |
+
+The exponential in PV lands inside the run-to-run spread of the reference (its three same-day runs gave 102.5 to
+104.4 weighted; the 2-request column moves 10% between runs of the same build). Lookup drafting fired on 3% of the
+drafting rounds (962 of 32,734, 3,753 tokens proposed, nearly all strong matches) and cost 1 to 5% at 1 and 2 requests,
+as the copy probe predicted: the proposed rows are verified and mostly rejected.
+
+At depth (`deepctx.py`: one conversation whose first turn is a 199,736-token synthetic code base, then copy / rename /
+prose turns at that depth, two cycles of the four configurations, temperature 1.0):
+
+| build | cold prefill of 200k tokens | copy at 200k (decode t/s, acceptance) | rename at 200k | prose at 200k |
+|---|--:|--:|--:|--:|
+| switches off | 393.7 / 395.6 s (505-507 tok/s) | 94-104, 73-79% | 107-110, 82-85% | 44-56, 26-36% |
+| exponential in PV | 392.3 / 392.6 s (509 tok/s) | 99-105, 76-79% | 105-111, 81-86% | 43-56, 25-36% |
+| lookup drafting | 396.0 / 396.2 s (504 tok/s) | 66-68, 46% | 69-71, 48-50% | 44-47, 25-28% |
+| both | 392.6 / 393.2 s (508 tok/s) | 65-68, 45-46% | 68-71, 47-49% | 43-63, 24-43% |
+
+A follow-up turn prefills only its own ~50 tokens (the reply before it is already in the cache); that pass takes
+0.45-0.53 s in every configuration. The exponential in PV is 0.5% on the cold prefill, four runs against four, and
+nothing on decode. Lookup drafting fires on 79% of the rounds of a copy at this depth (98 of 124, the module being
+copied sits in the prompt) and loses a third of the decode speed: it drafts the full 7 rows every round where DFlash2
+drafts about 5 and stops where its confidence drops, the accepted count per round comes out the same, and at 200k keys
+each verified row is paid in attention. Lookup's 200k-token backward scan per round is not what costs; the rows are.
+
+Adopted: the exponential in PV is the default (0.5% on a 200k-token prefill, inside the noise elsewhere, 152 attention
+cases exact). The route's one-time log line names where the exponential runs, though the server does not surface that
+line (it never has; the route is live: LLAMA_FA_GQA6_Q8=0 costs 1-3% of prefill at 16k-40k tokens). Lookup drafting
+stays in the tree as an opt-in switch, for a greedy or a calibrated-row experiment.
+
+## 26. A cancelled prompt job keeps the conversation
+
+A client cancel that lands inside a two-user prompt job (a 2048-token group takes 1-5 s at depth, so most cancels of a
+follow-up on a long conversation do) ended with the slot cleared: "the slot starts over". In production on 2026-11-02
+that dropped a 166k-token conversation 3 s into a follow-up; the retry one second later found no slot to match, began
+the 173k-token prompt from zero and was cancelled again at 15%; the next morning's query finished it in 289 s.
+
+Now (`TAG_TU_CANCEL_KEEP`) the slot keeps the tokens before the job's batch, the cache keeps the ubatches that
+completed (the context ends a cancelled job at a ubatch boundary) and the drafter's state, which never saw the batch,
+matches the kept tokens. The next launch meets the same state as after a shortened prompt: the recurrent state sits
+past the kept tokens, so it restores the checkpoint below them and re-reads from there, then removes the cells past the
+prompt. A cancel costs the distance from the last checkpoint, not the conversation. The log line names the kept count:
+`TU job: slot N cancelled after G groups, D of T tokens in the cache; the slot keeps K tokens`.
+
+Probe (`cancel_probe.py`: a 41k-token conversation, then an 8k-token follow-up cancelled 1.5 s and 4 s in, each re-sent):
+before, the retry read 51,719 and 62,106 tokens (the conversation gone each time); now 10,348 both times, the follow-up
+plus the re-read from the last checkpoint, with the cancelled job's 2,048 cached tokens discarded as the state past
+the kept prefix.
+
+## 27. The streaming kernel takes prompts of up to 64 tokens
+
+A profile of production's prefill (2026-11-05, branch `prefill-levers`, `profall.sh`): shallow, the weights GEMM is
+62% of the kernel time at 75% of the card's peak, the per-call expansion of the repacked weights to fp16 9%, the gqa6
+attention 12%, the GDN kernels 10%; at 174k tokens the attention is 61%. The attention route pads a prompt's rows to
+128-row tiles: 17 rows run at 7.5 TFLOPS, 32 at 13, 128 at 35, 1,024 and more at 42.
+
+Now (`TAG_FVS_ROWS`) the decode attention kernel, which streams the Q8_0 cache in 8-token blocks, takes prompts of up to
+64 tokens (`LLAMA_FATTN_VERIFY_STREAM_MAX_TOK`, a multiple of 8 from 8 to 64; 16 was the cap, and `=16` restores it).
+Above 16 tokens each block streams the keys on its own, as the second block of 9-16 tokens already did. At 172k keys a
+17-row call takes 3.2 ms instead of the gqa6 route's 9.5, 32 rows 4.4 instead of 10.4, 64 rows 8.4 instead of 11.4;
+128 rows and more stay on gqa6. The eval cases at 17 and 64 rows pass; a 64-row perf case joins the list.
+
+Where it acts, a chat client's follow-ups on a 180k-token conversation (`levers_probe.py`, user messages of 25 to
+1,016 prompt tokens, each prefilled on its own after its checkpoint):
+
+| follow-up (prompt tokens) | 25 | 36 | 52 | 68 | 136 | 316 | 1,016 |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| cap 16 (gqa6 from 17 rows) | 0.45 s | 0.46 s | 0.50 s | 0.51 s | 0.73 s | 1.26 s | 3.23 s |
+| cap 64 | 0.37 s | 0.36 s | 0.42 s | 0.52 s | 0.73 s | 1.26 s | 3.23 s |
+
+80-100 ms off every follow-up of up to 64 tokens at that depth (16 to 22%), nothing above the cap, nothing on cold
+prefills (950 tok/s at 16k, 538 at 180k, both ways). BetterBench (temperature 1.0, the production launcher, 2026-11-06):
+106.3 weighted against the rsZ baseline's 104.6 the same night, 92.4 / 120.2 / 161.0 aggregate tok/s at 1 / 2 / 4
+requests against 92.5 / 119.4 / 158.8, prefill 955 / 944 / 820 tok/s at 2k / 16k / 64k against 950 / 942 / 818: inside
+the spread, as the benchmark's turns are rarely that small.
+
+The profile's other lever, a CUTLASS GEMM that reads the repacked weights itself instead of expanding them to fp16 per
+call, is on branch `prefill-levers` (`qpn-gemm.cu`, `LLAMA_QPN_GEMM=1`, off): correct across 64 shapes, and 23% slower
+on prefill at every depth, the per-value decode being 60% of a warp's MMA issue time with no spare warps to hide it.
+Its CHANGES section 27 there holds the variants and the four-way BetterBench.
+
+Cold prefill at depth on the shipped image (rsAA, `pf2.sh`, a fresh container per run, 2026-11-06, rsZ the same
+morning): 128,009 tokens in 203.5 s (629 tok/s; rsZ 205.8 s, 622), 243,576 tokens in 530.7 s (459 tok/s; rsZ 531.2 s,
+459); the slot's limit is 245,760 cells, so 244k is the most one conversation can hold. Both sit on the curve of the
+earlier points (818 tok/s at 64k, 538 at 180k, 505-509 at 200k): the cap changes nothing on a cold prefill, which runs
+in 2,048-row chunks on gqa6 either way.
+
+The same two prefills with the card's 200 W power limit removed (2026-11-08, rsAB, the card at its 250 W board rating
+under a new fan at full speed; `pf2u.sh`, the same fresh-container method): 128,009 tokens in 183.9 s (696 tok/s, +11%),
+243,576 in 472.4 s (516 tok/s, +12%). The card drew 231-233 W on average through them, sat at the board limit on
+25-33% of the 2-second samples (peaks 265-279 W), and topped out at 62-64 C, against 72 C under the old fan at 200 W.
+Deep prefill is now bound by the board's own power limit, not by a cap; BetterBench's 1.5k-47k prefills gained 8-10%
+the same way and its decode did not move (it draws about 180 W).
+
+## 28. The attention's structure at depth (branch attn-depth)
+
+The question from section 27: with the attention at 61% of a 174k prefill and 70% at 244k, and the gqa6 route at 42
+TFLOPS against 1Cat's 71 (300 W SXM2) and 54 (their same kernel at 185 W), what does the card allow. Measured on the
+1,024-row x 172k-key perf case (`test-backend-ops perf`, Q8_0 K/V, exponential in PV), the production shape.
+
+**The GEMMs themselves.** cuBLAS on the two attention shapes (`cublasbench.cu`, fp16 in, fp32 accumulate, 6 heads
+packed, batch 4): the 256-deep QK product reaches 52-58 TFLOPS (fp16 out; 42-56 fp32 out) and PV 57-66, both on
+64x128 tiles (`volta_s884gemm_fp16_64x128_ldg8`). A 256-deep GEMM runs at half the card's peak however it is written;
+the 1Cat design (cuBLAS for both products, a separate softmax pass over an FP32 score buffer) would, on this card,
+pay the extra pass out of that and land where the fused-epilogue route already is. Nothing to port.
+
+**Where the QK kernel's time went.** With the epilogue stripped in stages (`LLAMA_FA_GQA6_QK_EXP`, wrong results): the
+main loop alone is 30 ms of the kernel's 59 per call (72 TFLOPS-equivalent, tensor pipe 80% active); CUTLASS's
+epilogue was the other half: the FP32 tile through 49 KB of shared memory in pieces 12 ms, the FP16 score store 6.5,
+the mask, maximum and sums 9. PV is 42 ms (254 registers, no spills, tensor pipe 56%, stalled on the score loads: 57%
+L2 hits, the scores stream from DRAM); the exponential in its load costs 5% of it.
+
+**The direct epilogue** (`TAG_GQA6_QK_DIRECT`, `LLAMA_FA_GQA6_QK_DIRECT=0` keeps CUTLASS's): the softmax straight from
+the accumulator fragments (the Volta interleaved layout: 8 rows by 16 columns a lane). A first version with 4-byte
+loads and stores was 8% slower than CUTLASS (twice the store sectors, an LSU queue stall). With a lane-pair exchange
+giving each lane 8 consecutive keys, so the mask is read and the scores stored 16 bytes at a time: 41.6 -> 45.7 TFLOPS
+at 1,024 and 2,048 rows, 34.3 -> 37.2 at 128 (QK 59 -> 50 ms); the exact tile maximum, bit-identical scores, the 60
+six-head Q8_0 eval cases pass. What the 20 ms of epilogue still are (the same stripping): the score store 8 ms, the
+mask and maximum 3.4, the cross-warp exchange 0.6, the rest arithmetic and conversions on a latency-bound chain with
+two warps a scheduler. Variants that did not move it: statistics per 64-key warp tile with no barrier (-2%: four
+times the scale reloads in PV); the mask tile parked in shared memory before the main loop (0); scores stored in
+fragment order with V widened in the same key order, no exchange at all (0, and 1,000 fewer instructions a warp and
+tile: the chain is not instruction-bound); the first wave's odd blocks delayed half a tile so the SMs' store phases
+stop coinciding (0); evict-first score stores (0, though the score stream does push K and Q out of L2: 75% hits
+against 90% without stores, 98 MB of DRAM reads a launch against 39); a 64-deep pipeline stage (CUTLASS's Volta
+layouts do not support it: illegal access). On the PV side: prefetching the scores to L2 one to four stages ahead
+(-1 to -4%), three or four key splits or a split count that follows the row count (-7% at 1,024 rows, noise at 128).
+
+**The fused kernel, bounded before it was written.** A Volta flash-attention kernel (QK tile, softmax in registers,
+P through shared memory into PV, O in registers) removes the score round trip (the 8 ms store, PV's DRAM-latency
+loads) but has to hold O (64 rows x 256 dims in FP32 = 64 registers a thread with 8 warps) beside the QK accumulators
+and the double-buffered fragments, so its warp tiles are 32x64, not 64x64. The QK main loop alone, re-tiled
+(`LLAMA_FA_GQA6_QK_EXP=4`): 128x256 / 64x64 warps 30 ms, 128x128 / 64x32 35.5 (+18%), 64x256 / 32x64 38 (+26%),
+64x128 / 32x32 47.5 (+58%). Both GEMM phases at +26% cost about what the round trip saves; the expected net is 0 to
++5% for a multi-day kernel with spill risk. Not written. On this card the two-kernel route with the direct epilogue
+is within a few percent of what the register file allows at head dimension 256.
+
+On the server (the dev build, one slot, a cold 128k prefill, `qkdirect-srv.sh`): 643 tok/s against 617 with the
+switch off (199.1 s against 207.4), +4% where the attention is about half the prefill; at 244k, where it is 70%, the
+cap is about +7%. Candidate for main.
+
+BetterBench (temperature 1.0, the production launcher, 2026-11-06, rsAA the same session): rsAB (this epilogue) 102.2
+weighted decode, 90.1 / 123.6 / 156.0 aggregate tok/s at 1 / 2 / 4 requests, prefill 951 / 948 / 826 tok/s at 2k /
+16k / 64k; rsAA 101.1, 94.2 / 120.5 / 161.7, 951 / 945 / 816. Inside the spread everywhere but the 64k prefill (+1%),
+as expected: the benchmark's depths are where the attention is a small share. No errors, peak VRAM unchanged (31.9 GB).
+Adopted: main, image rsAB.
+
+## 30. Host work in the decode round (2026-11-09: decode +0.4 to +0.8%, outputs identical)
+
+A review of the decode round on 2026-11-09 (the card was off; section 29 is the `qwen4` branch's). The round is GPU
+bound: 94% busy, 81% of that in the weight kernels (the 2026-10-23 profile). What the host adds is small, and most of
+it hides under the drafter's injection, about 1.9 ms of GPU time issued after each verify. It shows when the host
+window is longer than that: requests with a tool list, whose sampler clones are heavy, and deep conversations. Four
+changes, each exact (the served tokens do not change) and each behind a switch that restores the previous code:
+
+- **A clone of a grammar shares its rules** (`TAG_GRAMMAR_SHARED_RULES`, `LLAMA_GRAMMAR_SHARE_RULES=0` copies). The
+  rules never change after init (upstream's own `TODO: shared ptr`). A clone copied every rule, then compared every
+  stack element with every rule element to redirect its pointers, a loop with no break: stack elements x rule
+  elements comparisons a clone. A speculative round clones the sampler for the draft's rejection picks and for the
+  block verification. Now the clone holds
+  the same `shared_ptr` and its copied stacks already point into it. `test-grammar-integration` gains `test_clone`
+  (a clone taken mid-input: the same stacks, its own progress, a clone of a clone, a clone outliving its source).
+- **The sampler's saved copy is cloned only when it can be read** (`TAG_SPEC_SAVE_LAZY`, `LLAMA_SPEC_SMPL_SAVE=1`
+  clones every round). The copy is read on one branch, a partial acceptance that restores the checkpoint, which needs
+  a rollback deeper than the context supports. At most n_draft tokens roll back, so with a recurrent target at an
+  n-max within the rollback depth (every production round) the branch is unreachable and the third clone of the round
+  was dead work.
+- **The slot's tokens are copied for the draft only when something reads the copy** (`TAG_SPEC_PROMPT_LAZY`,
+  `LLAMA_SPEC_PROMPT_COPY=1` copies every round). `spec_prompt` was rebuilt every round, one pass over every token of
+  the conversation; its readers are the ngram drafters and the lookup of section 25
+  (`common_speculative_needs_prompt`). A draft model keeps its own state.
+- **The drafter's injection is issued with the target's decode** (`TAG_SPEC_PROCESS_EARLY`,
+  `LLAMA_SPEC_PROCESS_EARLY=0` restores the two yields). `common_speculative_process` ran in a queue yield of its own
+  after the target's synchronize, the metrics in between: the GPU sat idle from the end of the verify graph until the
+  injection's host preparation was done. It now runs in the decode's yield, before the synchronize. It needs nothing
+  the synchronize delivers: the feature rows go device to device, copied on the target's stream behind its graph, and
+  the drafter's stream waits on that copy's event; the host path's getter synchronizes itself. DFlash drafters only
+  (`common_speculative_process_early_ok`); `LLAMA_TU_DIAG` keeps the two yields.
+
+Verified here: the CPU and CUDA servers build; `test-grammar-integration`, `test-llama-grammar`,
+`test-grammar-parser`, `test-json-schema-to-grammar`, `test-chat`, `test-chat-auto-parser`, `test-chat-peg-parser`,
+`test-chat-template`, `test-sampling`, `test-spec-rejection`, `test-spec-draft-grammar` and `test-reasoning-budget`
+pass with the defaults and with `LLAMA_GRAMMAR_SHARE_RULES=0`.
+
+Measured on the card on 2026-11-09 (the V100 uncapped, production's launcher settings, `~/src/q8bench/hc.sh`,
+results in `results/hc/`). The probe `hcprobe.py` sends 21 fixed requests on one slot, each at temperature 0 or at
+temperature 1.0 with a fixed seed: plain chat, a five-turn agent loop with a 14-tool list, a JSON schema, a 1,400-token
+file written through a tool call, and a 99,645-token conversation with a verbatim copy, a tool-call write and prose
+on top. Three servers ran it with the round timers on: this build with the switches at their defaults (new), this
+build with the four switches restored (old), and the previous build.
+
+- Outputs: all 21 requests are identical, character for character, across the three, and across six more passes
+  without timers (new and old alternating, three each). No assert or CUDA error in any log; 65 C at most.
+- Round time, new against old, microseconds of host round on the same rounds (the outputs being identical, the two
+  ran the same rounds): plain chat 41,185 -> 41,026 (-0.4%), the agent loop 42,390 -> 42,050 (-0.8%), the tool-call
+  write 42,050 -> 41,740 (-0.75%), the JSON schema 48,370 -> 47,380 (-2.0%), 100k deep 51,640 -> 51,230 (-0.8%).
+  GPU busy time is unchanged; the idle time between graphs falls by 0.2 to 0.6 ms a round. The old code and the
+  previous build agree within 0.1% on every request: the switches do restore it.
+- Decode rate over the alternating passes (three each, ranges that do not overlap on any request but each
+  server's first): plain +0.4%, the agent loop +0.7%, the tool-call write +0.7% (142.6 against 141.6 tok/s), the JSON
+  schema +2.1% (90.9 against 89.0).
+- Where it comes from. Sampler clones a round: 3 -> 2 without a grammar, 2 -> 1 with one. A clone with the 14-tool
+  grammar costs 20 us instead of 60 (`cs.clone` 120 -> 20 us a round); with the schema's grammar about 530 us
+  either way, because there the stacks are the cost, not the rules. The early injection does not overlap the verify:
+  the drafter's decode synchronizes its own stream while it prepares, and that stream waits on the copy behind the
+  target's graph, so `spec.process` now blocks for the verify's 34 ms and the synchronize after it finds the work
+  done. What it saves is the hand-off: the gap from the target's graph to the drafter's injection falls from
+  286-311 us to 102-106 us a round on every request. The gap from the injection to the draft falls with the clones
+  (357 -> 280 us in the tool-call write) and, at 100k, with the token copy (556 -> 355 us).
+- Several slots at once (`hcconc.sh`, `hcconc2.sh`): a 21k-token prompt read beside a generating slot gives the
+  same two outputs on new and old, four runs out of four. Three slots decoding greedily at once are not repeatable
+  on any build: of eight runs each against one reference, old matched in three, new in two, the previous build in
+  four, always at the same few positions (tokens 35, 36, 70, 120, 191), which move with the order the requests
+  arrive in. No error in any of them.
+- Seen on the way, not part of this change: with the JSON schema (an array of exactly 12 objects) the grammar work
+  of a round takes 6.3 to 7 ms (`srv.accept_block`), against 0.3 ms inside a tool call's body, and the round's idle
+  time is 9 ms against 2. Acceptance in the tool-call bodies was 70% shallow and 80% at 100k.
+
+Left out, from the same review: the next draft launched right after the acceptance (the host work it would hide
+already runs under the injection), the forward's 96 ring `set_rows` fused into the conv-slots launch (a CUDA kernel
+change, 0.3-0.6 ms, to write with the card at hand and `LLAMA_RS_REPLAY_SELFTEST`), the graph compatibility walk
+cached per uid (20-50 us). Two findings of the review are not host work and are not in this branch: a drafted row
+loses the rejection step once a tool call's grammar has triggered (`common_sampler_rejection_row_ok`), and the
+streaming verify kernel reads a Q8_0 cache at about 306 GB/s where it reads an F16 one at 659 (section 1's numbers).
+
+## 31. Rejection sampling inside tool calls, and the graph check kept per graph (2026-11-09: tool-call bodies +4.5%, decode +0.3 to +0.4%)
+
+Two of the review's items of section 30, measured on 2026-11-09 with the same method (fixed requests, identical outputs
+where the change is exact, alternating servers).
+
+**The rejection step under a tool call's grammar** (`TAG_SPEC_REJECTION_GRAMMAR`, `LLAMA_SPEC_REJECTION_GRAMMAR`,
+default 1; 0: as before; 2: under any grammar). Once a lazy grammar had triggered, a drafted row lost the rejection
+step: the draft proposed its argmax and the verify sampled the target and compared, so a tool call's body, where a
+coding agent writes its files, decoded on the sample-and-match rule (with `LLAMA_SPEC_REJECTION=0` its output did not
+change by a token). `common_sampler_sample` draws from the chain and keeps the token when it fits the grammar; only a
+token that does not fit sends it to a second draw with the grammar first. So on a row where every candidate with
+probability fits the grammar, the chain's distribution is the row's distribution, and the rejection step is exact
+there. Now such a row takes the step (the token step and the block verification both), the draft's q is its candidates
+that fit, renormalized, and a row with a candidate that does not fit keeps the two draws. Not at temperature 0 (the
+step cannot gain there) and by default not under a grammar that is not lazy: a JSON schema's grammar costs more to
+read than the step gains (a schema of 12 fixed objects lost 4% with it, 86.9 against 90.7 tok/s).
+- The write-tool task of section 30's probe at temperature 1.0, eight seeds: 142.0 tok/s against 135.8 (+4.5%),
+  acceptance 0.710 against 0.669. Every row read through the grammar had only candidates that fit (3,082 of 3,082 in
+  the first three seeds), so no row fell back.
+- For scale: the same file written as plain content decodes at 160 tok/s with the rejection step (acceptance 0.787)
+  and 143 without (0.699); the tool call's JSON string is harder for the draft.
+- The distribution is the target's: over 60 seeds the first tool called was write 51, grep 8, glob 1 with the step and
+  50, 9, 1 without. The greedy requests and every request without tools give the outputs of the previous build,
+  character for character; a seeded request with tools gives another sample of the same distribution, as the
+  rejection step always did for plain text.
+- `test-spec-draft-grammar` checks the draft's pick under a triggered grammar (q holds only candidates that fit, sums
+  to 1, the pick is accepted by the grammar; nothing fits: no pick).
+
+**The graph compatibility walk kept per graph uid** (`TAG_CG_COMPAT_CACHE`, `LLAMA_CG_COMPAT_CACHE=0` walks every
+time). Before each launch the backend walked every node of the graph to decide whether it may run as a CUDA graph:
+98.5 us on the verify graph's 4,574 nodes, 17 us on each of the drafter's two, all before the launch, the GPU idle.
+The answer depends on the nodes' ops, shapes and weights only, so a graph with the uid the walk last ran on keeps its
+answer (the reuse `ggml_cuda_graph_update_required` already trusts). Outputs identical on the 17 requests; the walk
+falls to 1 us a round, the host round by 118 us (41,716 -> 41,598), and the decode rate rises 0.3 to 0.4% on every
+request in two alternating passes each (143.6 against 143.2 tok/s on the tool-call write).
+
+Measured and not built: the forward's ring writes. An nsys node trace of decode shows 96 `k_set_rows` a round at
+3.1 us each on the target's stream, 0.3 ms a round, 0.7%: the ceiling of fusing them, half in the conv-slots kernel
+(the x ring) and half in the gated delta net kernel (the alpha/beta ring).
+
+The streaming verify kernel on a Q8_0 cache (branch `q8-fvs`, experiments, all off): 462-473 us a call at 65,536 keys
+x 8 tokens, an F16 cache 394-399. Fewer or wider loads do not help (two 8-byte loads with a word select 502-506; the
+scale by a shuffle 476-481; per-thread offsets 461-467), and neither does reading each row from global memory once
+with the raw rows staged in shared memory (K rows 462, V rows 462-468, both exact). The probes say why: the time is in
+the PV warps' product loop, their reads and their widening (one read a lane on V alone: 375; no widening on V: 432),
+and the QK warps have room. A probe that has the QK warps load and widen 3/8 of each V tile into shared memory as F16,
+the PV warps reading it with one load, runs in 429 us (4/8: 431, 5/8: 443): about 8.5% of the kernel, which is 2% of a
+round at 100k and 3% at 200k. The exact version needs the V part's hand-over between the two groups.

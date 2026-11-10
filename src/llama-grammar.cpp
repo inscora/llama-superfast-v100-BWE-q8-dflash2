@@ -1010,7 +1010,7 @@ static bool llama_grammar_detect_left_recursion(
 }
 
 const llama_grammar_rules & llama_grammar_get_rules(const struct llama_grammar * grammar) {
-    return grammar->rules;
+    return *grammar->rules;
 }
 
 llama_grammar_stacks & llama_grammar_get_stacks(struct llama_grammar * grammar) {
@@ -1039,7 +1039,7 @@ static void llama_grammar_accept_chr(
         if (!llama_grammar_is_end_of_sequence(match.second)) {
             new_stack.push_back(match.second);
         }
-        llama_grammar_advance_stack(grammar.rules, new_stack, new_stacks);
+        llama_grammar_advance_stack(*grammar.rules, new_stack, new_stacks);
     }
 }
 
@@ -1196,7 +1196,7 @@ struct llama_grammar * llama_grammar_init_impl(
     // then the pointers would be invalidated when the local vec_rules goes out of scope.
     return new llama_grammar {
         vocab,
-        std::move(vec_rules),
+        std::make_shared<const llama_grammar_rules>(std::move(vec_rules)),
         std::move(stacks),
         /* .partial_utf8 = */             {},
         /* .lazy = */                     false,
@@ -1302,7 +1302,7 @@ struct llama_grammar * llama_grammar_init_impl(
     // then the pointers would be invalidated when the local vec_rules goes out of scope.
     return new llama_grammar {
         vocab,
-        std::move(vec_rules),
+        std::make_shared<const llama_grammar_rules>(std::move(vec_rules)),
         std::move(stacks),
         /* .partial_utf8 = */             {},
         /* .lazy = */                     lazy,
@@ -1323,9 +1323,15 @@ void llama_grammar_free_impl(struct llama_grammar * grammar) {
 }
 
 struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & grammar) {
+    // [TAG_GRAMMAR_SHARED_RULES] a clone shares the immutable rules, so the copied stacks already point into them. Before,
+    // each clone copied every rule and then compared every stack element with every rule element to redirect it (no
+    // break): with a tool list's grammar that is the bulk of a sampler clone, and a speculative round clones the sampler
+    // for the draft and again for the block verification. LLAMA_GRAMMAR_SHARE_RULES=0 copies and redirects, as before
+    static const bool share = [] { const char * e = getenv("LLAMA_GRAMMAR_SHARE_RULES"); return e == nullptr || atoi(e) != 0; }();
+
     auto * result = new llama_grammar {
         grammar.vocab,
-        grammar.rules,
+        share ? grammar.rules : std::make_shared<const llama_grammar_rules>(*grammar.rules),
         grammar.stacks,
         grammar.partial_utf8,
         grammar.lazy,
@@ -1336,13 +1342,17 @@ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & gra
         grammar.trigger_patterns,
     };
 
-    // redirect elements in stacks to point to new rules
-    for (size_t is = 0; is < result->stacks.size(); is++) {
-        for (size_t ie = 0; ie < result->stacks[is].size(); ie++) {
-            for (size_t ir0 = 0; ir0 < grammar.rules.size(); ir0++) {
-                for (size_t ir1 = 0; ir1 < grammar.rules[ir0].size(); ir1++) {
-                    if (grammar.stacks[is][ie] == &grammar.rules[ir0][ir1]) {
-                        result->stacks[is][ie] =  &result->rules[ir0][ir1];
+    if (!share) {
+        // redirect elements in stacks to point to new rules
+        const llama_grammar_rules & rules_src = *grammar.rules;
+        const llama_grammar_rules & rules_dst = *result->rules;
+        for (size_t is = 0; is < result->stacks.size(); is++) {
+            for (size_t ie = 0; ie < result->stacks[is].size(); ie++) {
+                for (size_t ir0 = 0; ir0 < rules_src.size(); ir0++) {
+                    for (size_t ir1 = 0; ir1 < rules_src[ir0].size(); ir1++) {
+                        if (grammar.stacks[is][ie] == &rules_src[ir0][ir1]) {
+                            result->stacks[is][ie] =  &rules_dst[ir0][ir1];
+                        }
                     }
                 }
             }
@@ -1389,7 +1399,7 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
         }
     }
 
-    const auto rejects = llama_grammar_reject_candidates(grammar.rules, grammar.stacks, candidates_grammar);
+    const auto rejects = llama_grammar_reject_candidates(*grammar.rules, grammar.stacks, candidates_grammar);
     for (const auto & reject : rejects) {
         cur_p->data[reject.index].logit = -INFINITY;
     }
@@ -1490,7 +1500,7 @@ void llama_grammar_accept_token(struct llama_grammar & grammar, llama_token toke
                 if (!llama_grammar_is_end_of_sequence(pos + 1)) {
                     new_stack.push_back(pos + 1);
                 }
-                llama_grammar_advance_stack(grammar.rules, new_stack, stacks_new);
+                llama_grammar_advance_stack(*grammar.rules, new_stack, stacks_new);
             }
         } else {
             llama_grammar_stacks current_stacks = {stack};

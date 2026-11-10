@@ -273,6 +273,12 @@ struct server_slot {
     // request's rounds verified with the rejection step, rounds that took today's path instead, and the rows that
     // took the step
     std::vector<common_rejection_q> spec_q;
+    // [TAG_SPEC_LOOKUP] this request's rounds whose draft the context lookup replaced (strong: the whole draft; weak: after
+    // the drafter's agreeing prefix), and the tokens it proposed
+    int32_t lk_rounds = 0;
+    int32_t lk_strong = 0;
+    int32_t lk_weak   = 0;
+    int32_t lk_tokens = 0;
     // [TAG_SPEC_REJECTION_PIPE] with the pipeline as well: the draft's own generator, seeded from the
     // request's seed, for every draft token the pipelined loop samples, so the verify's draws (the target's generator)
     // do not depend on which chunks were drafted, submitted or dropped
@@ -873,6 +879,7 @@ struct server_slot {
         spec_is_replay = false;
 
         spec_q.clear();
+        lk_rounds = lk_strong = lk_weak = lk_tokens = 0;
         n_rs_rounds   = 0;
         n_rs_fallback = 0;
         n_rs_row_fb   = 0;
@@ -1178,6 +1185,17 @@ struct server_slot {
                     "   backend top-k = %d candidates, %llu rows sampled, %llu of them from the full logits\n",
                     backend_topk_n, (unsigned long long) n_rows, (unsigned long long) n_full);
         }
+        if (smpl) {
+            // [TAG_SPEC_REJECTION_GRAMMAR]
+            uint64_t n_rows  = 0;
+            uint64_t n_unfit = 0;
+            common_sampler_rejection_grammar_stats(smpl.get(), &n_rows, &n_unfit);
+            if (n_rows > 0) {
+                SLT_INF(*this,
+                        " grammar rejection = %llu rows read through the grammar, %llu of them with a candidate that does not fit\n",
+                        (unsigned long long) n_rows, (unsigned long long) n_unfit);
+            }
+        }
 
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;
@@ -1200,6 +1218,10 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
+            if (lk_rounds > 0) {
+                SLT_WRN(*this, "lookup drafting (LLAMA_SPEC_LOOKUP): %d of %d rounds took the context's continuation (%d strong, %d weak), %d tokens proposed\n",
+                        lk_rounds, n_draft_verif_steps, lk_strong, lk_weak, lk_tokens);
+            }
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
@@ -4201,6 +4223,108 @@ private:
         return llama_memory_rs_pool(mem) > 0 ? llama_memory_rs_depth(mem, slot.id) : llama_n_rs_seq(ctx_tgt);
     }
 
+    // [TAG_SPEC_LOOKUP] LLAMA_SPEC_LOOKUP=1: lookup drafting beside DFlash2 (after 1Cat's lookup-augmented block drafting,
+    // itself from syv-ai/HyperQwen). After the draft, the request's own tokens are scanned backwards for the most recent
+    // earlier occurrence of its last LOOKUP_NMAX tokens (at least LOOKUP_NMIN of them). A strong match (LOOKUP_NSTRONG or
+    // more tokens) replaces the whole draft with the tokens that followed the earlier occurrence, up to LLAMA_SPEC_LOOKUP_WIDE
+    // of them (default 7, the drafter's width; more only when this slot generates alone, within its rollback depth and
+    // the 16-row verify); a weaker match replaces the draft after its first LOOKUP_AGREE tokens when the drafter proposed
+    // those same tokens. A replaced position gets a one-token draft distribution (its token with probability 1), so the
+    // rejection and block steps accept it with the target's probability for it and otherwise sample the target's
+    // residual: the output distribution is the target's, as with any draft. The drafter's state does not depend on what
+    // was drafted, only on what was accepted, so the replacement does not touch it
+    static bool lookup_on() {
+        static const bool v = [] { const char * e = getenv("LLAMA_SPEC_LOOKUP"); return e != nullptr && atoi(e) != 0; }();
+        return v;
+    }
+
+    void lookup_fuse(server_slot & slot, int32_t n_gen) {
+        static const int32_t wide    = [] { const char * e = getenv("LLAMA_SPEC_LOOKUP_WIDE");    return e ? std::max(1, atoi(e)) : 7; }();
+        static const int32_t nmin    = [] { const char * e = getenv("LLAMA_SPEC_LOOKUP_NMIN");    return e ? std::max(1, atoi(e)) : 6; }();
+        static const int32_t nmax    = [] { const char * e = getenv("LLAMA_SPEC_LOOKUP_NMAX");    return e ? std::max(1, atoi(e)) : 12; }();
+        static const int32_t nstrong = [] { const char * e = getenv("LLAMA_SPEC_LOOKUP_NSTRONG"); return e ? std::max(1, atoi(e)) : 8; }();
+        static const int32_t agree   = [] { const char * e = getenv("LLAMA_SPEC_LOOKUP_AGREE");   return e ? std::max(0, atoi(e)) : 2; }();
+
+        const llama_tokens & hist = slot.spec_prompt; // the tokens before the one the draft starts from
+        const llama_token    last = slot.sampled;
+        const int64_t n = (int64_t) hist.size() + 1;  // with that one
+        if (n < nmin + 2) {
+            return;
+        }
+        auto tok = [&](int64_t i) { return i < (int64_t) hist.size() ? hist[i] : last; };
+
+        // the most recent earlier end j of the longest match of the last tokens, strong first
+        int64_t best_j = -1;
+        int32_t best_l = 0;
+        for (int64_t j = n - 2; j >= nmin - 1; --j) {
+            if (tok(j) != last) {
+                continue;
+            }
+            int32_t l = 1;
+            while (l < nmax && j - l >= 0 && tok(j - l) == tok(n - 1 - l)) {
+                ++l;
+            }
+            if (l >= nstrong) {
+                best_j = j;
+                best_l = l;
+                break;
+            }
+            if (l >= nmin && l > best_l) {
+                best_j = j;
+                best_l = l;
+            }
+        }
+        if (best_j < 0) {
+            return;
+        }
+        const bool strong = best_l >= nstrong;
+        const int64_t avail = n - 1 - best_j; // the tokens that followed the earlier occurrence
+
+        // the width: the drafter's (its cap this round), or wider on a strong match with the slot generating alone
+        const auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
+        const int32_t full = common_speculative_n_max(spec.get());
+        int32_t cap = dp.n_cap > 0 ? std::min(dp.n_cap, full) : full;
+        if (strong && n_gen <= 1 && wide > cap) {
+            cap = std::max(cap, std::min({ wide, (int32_t) rs_depth(slot), slot.get_n_draft_max(), 15 }));
+        }
+        const int32_t width = (int32_t) std::min<int64_t>(cap, avail);
+        auto & draft = slot.spec_draft;
+        auto & q     = slot.spec_q;
+        const bool with_q = !draft.empty() && q.size() == draft.size();
+
+        // the drafter's rows that agree with the continuation stay (their distribution accepts a token the target also
+        // favours with probability ~1, a one-token row only with the target's probability for it): the continuation takes
+        // over from the first disagreement, or past the drafter's last token. A weak match only fills past that end
+        int32_t keep = 0;
+        while (keep < (int32_t) draft.size() && keep < width && draft[keep] == tok(best_j + 1 + keep)) {
+            ++keep;
+        }
+        if (!strong) {
+            if (keep < (int32_t) draft.size() || keep < agree) {
+                return;
+            }
+        }
+        if (keep >= width) {
+            return; // nothing to add
+        }
+        draft.resize(width);
+        if (with_q || draft.empty()) {
+            q.resize(width);
+        } else {
+            q.clear(); // the round takes the token step without q, as it would have
+        }
+        for (int32_t i = keep; i < width; ++i) {
+            draft[i] = tok(best_j + 1 + i);
+            if (!q.empty()) {
+                q[i] = { llama_token_data{ draft[i], 0.0f, 1.0f } };
+            }
+        }
+        slot.lk_rounds++;
+        slot.lk_strong += strong ? 1 : 0;
+        slot.lk_weak   += strong ? 0 : 1;
+        slot.lk_tokens += width - keep;
+    }
+
     bool rejection_round(const server_slot & slot, size_t n_draft) const {
         if (!common_speculative_rejection() || slot.spec_is_replay || slot.spec_q.size() != n_draft || n_draft != slot.spec_draft.size() ||
                 !common_sampler_rejection_ok(slot.smpl.get())) {
@@ -5589,11 +5713,28 @@ private:
                     server_slot & slot = *tu_job.slot;
                     llama_decode_job_info info = {};
                     llama_decode_job_get_info(ctx_tgt, &info);
-                    LOG_WRN("TU job: slot %d cancelled after %d groups\n", slot.id, info.n_groups);
-                    // the cache holds the ubatches that completed, the slot's tokens the whole batch: the slot starts over
+                    // [TAG_TU_CANCEL_KEEP] the cache holds the ubatches that completed, the slot's tokens the whole batch, and
+                    // the drafter saw none of it: the slot keeps the tokens before this job's batch. Its next launch meets the
+                    // same state as after a shortened prompt (the recurrent state and the cells past the kept tokens): it
+                    // restores the checkpoint below them and re-reads from there. Clearing the slot instead cost a 166k-token
+                    // conversation its whole prefill when a client cancel landed 3 s into a follow-up
+                    const int32_t n_keep = std::max<int32_t>(0, slot.prompt.n_tokens() - (int32_t) batch_tu.size());
+                    LOG_WRN("TU job: slot %d cancelled after %d groups, %d of %d tokens in the cache; the slot keeps %d tokens\n",
+                            slot.id, info.n_groups, info.n_tokens_done, info.n_tokens, n_keep);
                     slot.tu_owned = false;
                     slot.release();
-                    slot.prompt_clear();
+                    if (n_keep > 0) {
+                        slot.prompt.tokens.keep_first(n_keep);
+                        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                            if (it->n_tokens > n_keep) {
+                                it = slot.prompt.checkpoints.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                    } else {
+                        slot.prompt_clear();
+                    }
                     tu_job.active = false;
                     batch_tu.clear();
                 } break;
@@ -5844,7 +5985,16 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        // [TAG_SPEC_PROMPT_LAZY] the slot's tokens are copied for the draft only when something reads the
+                        // copy: an ngram drafter or the lookup. A draft model (DFlash2, MTP) never does, and the copy is
+                        // every token of the conversation, every round (0.1 ms at 100k tokens, 0.3 ms at 244k).
+                        // LLAMA_SPEC_PROMPT_COPY=1 copies every round, as before
+                        static const bool spec_prompt_copy = [] { const char * e = getenv("LLAMA_SPEC_PROMPT_COPY"); return e != nullptr && atoi(e) != 0; }();
+                        if (spec_prompt_copy || lookup_on() || common_speculative_needs_prompt(spec.get())) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        } else if (!slot.spec_prompt.empty()) {
+                            slot.spec_prompt.clear(); // not a stale copy
+                        }
 
                         // [TAG_SPEC_ADAPT_WIDTH] the narrow width, or no cap
                         const int32_t ada_full = common_speculative_n_max(spec.get());
@@ -5902,6 +6052,12 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            // [TAG_SPEC_LOOKUP] the context's own continuation in place of the draft where the output is copying it
+            if (lookup_on()) {
+                for (server_slot * s : drafting) {
+                    lookup_fuse(*s, n_gen_round);
+                }
+            }
         }
 
         // make checkpoints if needed
@@ -6943,10 +7099,25 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // [TAG_SPEC_PROCESS_EARLY] the drafter's processing of this batch (DFlash2: the injection of the rows' target
+        // features into its cache) is issued in the same yield, between the target's decode and its synchronize, instead
+        // of in a yield of its own after it. It reads nothing the synchronize delivers: on the device path the feature
+        // rows are copied on the target's stream, behind its graph, and the drafter's stream waits on that copy's event
+        // (ggml_backend_cuda_cpy_tensor_async); on the host path llama_get_embeddings_layer_inp synchronizes itself. So
+        // the injection is queued when the verify graph ends, not a queue hand-off, the metrics and the injection's host
+        // preparation later, with the GPU idle meanwhile. DFlash drafters only (common_speculative_process_early_ok).
+        // LLAMA_SPEC_PROCESS_EARLY=0 restores the two yields; the
+        // scheduler's diagnostic (LLAMA_TU_DIAG) keeps them, since it hashes the target's rows between the two
+        static const bool spec_process_early_env = [] { const char * e = getenv("LLAMA_SPEC_PROCESS_EARLY"); return e == nullptr || atoi(e) != 0; }();
+        const bool spec_process_early = spec_process_early_env && spec && !tu_policy.diag && common_speculative_process_early_ok(spec.get());
+        bool spec_process_ok = true;
         {
             GGML_RT_SCOPE("srv.decode_yield");
             queue_tasks.yield_to_queue([&]() {
                 ret = llama_decode(ctx_tgt, batch_view);
+                if (ret == 0 && spec_process_early) {
+                    spec_process_ok = common_speculative_process(spec.get(), batch_view);
+                }
                 if (ret == 0 && has_output) {
                     llama_synchronize(ctx_tgt);
                 }
@@ -7013,8 +7184,8 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
-            bool ok = true;
-            {
+            bool ok = spec_process_ok; // [TAG_SPEC_PROCESS_EARLY] already issued with the decode
+            if (!spec_process_early) {
                 GGML_RT_SCOPE("srv.process_yield");
                 queue_tasks.yield_to_queue([&]() {
                     ok = common_speculative_process(spec.get(), batch_view);
@@ -7194,7 +7365,16 @@ private:
             // verify and try to accept the draft
             GGML_RT_SCOPE("srv.accept_block");
             {
-                common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+                // [TAG_SPEC_SAVE_LAZY] the sampler's saved copy is only read when a partial acceptance restores the
+                // checkpoint, which takes a rollback deeper than the context supports: at most n_draft tokens roll back,
+                // so a draft within the rollback depth (every round with a recurrent target at n-max <= depth) never
+                // reads it. The clone copies the grammar's rules and its trigger buffer. LLAMA_SPEC_SMPL_SAVE=1 clones
+                // every round, as before
+                static const bool smpl_save_always = [] { const char * e = getenv("LLAMA_SPEC_SMPL_SAVE"); return e != nullptr && atoi(e) != 0; }();
+                const bool may_restore_ckpt =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft > rs_depth(slot));
+                common_sampler_ptr smpl_save(smpl_save_always || may_restore_ckpt ? common_sampler_clone(slot.smpl.get()) : nullptr);
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 if (coupled_debug() >= 2) {
@@ -7286,6 +7466,7 @@ private:
                         common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
+                        GGML_ASSERT(smpl_save); // n_rollback <= n_draft, so may_restore_ckpt held [TAG_SPEC_SAVE_LAZY]
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
 
                         return;
