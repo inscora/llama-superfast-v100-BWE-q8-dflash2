@@ -745,7 +745,7 @@ weighted decode, 90.1 / 123.6 / 156.0 aggregate tok/s at 1 / 2 / 4 requests, pre
 as expected: the benchmark's depths are where the attention is a small share. No errors, peak VRAM unchanged (31.9 GB).
 Adopted: main, image rsAB.
 
-## 30. Host work in the decode round (branch host-cleanups; measured 2026-11-09: +0.4 to +0.8%, outputs identical)
+## 30. Host work in the decode round (2026-11-09: decode +0.4 to +0.8%, outputs identical)
 
 A review of the decode round on 2026-11-09 (the card was off; section 29 is the `qwen4` branch's). The round is GPU
 bound: 94% busy, 81% of that in the weight kernels (the 2026-10-23 profile). What the host adds is small, and most of
@@ -807,7 +807,12 @@ build with the four switches restored (old), and the previous build.
   done. What it saves is the hand-off: the gap from the target's graph to the drafter's injection falls from
   286-311 us to 102-106 us a round on every request. The gap from the injection to the draft falls with the clones
   (357 -> 280 us in the tool-call write) and, at 100k, with the token copy (556 -> 355 us).
-- Seen on the way, not part of this branch: with the JSON schema (an array of exactly 12 objects) the grammar work
+- Several slots at once (`hcconc.sh`, `hcconc2.sh`): a 21k-token prompt read beside a generating slot gives the
+  same two outputs on new and old, four runs out of four. Three slots decoding greedily at once are not repeatable
+  on any build: of eight runs each against one reference, old matched in three, new in two, the previous build in
+  four, always at the same few positions (tokens 35, 36, 70, 120, 191), which move with the order the requests
+  arrive in. No error in any of them.
+- Seen on the way, not part of this change: with the JSON schema (an array of exactly 12 objects) the grammar work
   of a round takes 6.3 to 7 ms (`srv.accept_block`), against 0.3 ms inside a tool call's body, and the round's idle
   time is 9 ms against 2. Acceptance in the tool-call bodies was 70% shallow and 80% at 100k.
 
