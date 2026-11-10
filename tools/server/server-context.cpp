@@ -1185,6 +1185,17 @@ struct server_slot {
                     "   backend top-k = %d candidates, %llu rows sampled, %llu of them from the full logits\n",
                     backend_topk_n, (unsigned long long) n_rows, (unsigned long long) n_full);
         }
+        if (smpl) {
+            // [TAG_SPEC_REJECTION_GRAMMAR]
+            uint64_t n_rows  = 0;
+            uint64_t n_unfit = 0;
+            common_sampler_rejection_grammar_stats(smpl.get(), &n_rows, &n_unfit);
+            if (n_rows > 0) {
+                SLT_INF(*this,
+                        " grammar rejection = %llu rows read through the grammar, %llu of them with a candidate that does not fit\n",
+                        (unsigned long long) n_rows, (unsigned long long) n_unfit);
+            }
+        }
 
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;
