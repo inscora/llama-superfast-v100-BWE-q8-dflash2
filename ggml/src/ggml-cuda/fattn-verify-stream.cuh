@@ -75,9 +75,23 @@ static __device__ __forceinline__ float ex2(const float x) {
 // returned raw as {codes 0-3, codes 4-7, d, 0}. W (Q8_0 only): the codes as three 4-byte loads of the aligned 12-byte window
 // around them and two funnel shifts (they start 2 or 0 bytes past a 4-byte boundary: blocks are 34 bytes, rows 16-aligned),
 // instead of four 2-byte loads; the same code on every lane, no branch
-template <bool Q8, bool W = false>
-static __device__ __forceinline__ uint4 ld_row8(const char * p, const int off) {
-    if constexpr (Q8) {
+// X (Q8_0 only, [TAG_FVS_Q8_LD2]): two 8-byte loads a lane instead of four loads. The lane's 8 codes always lie inside the
+// aligned 16-byte window around them. The lane that holds a block's first codes starts its window at the block's d (the
+// two bytes before them; the window still holds its codes), takes d from it, and the block's other three lanes get d from
+// that lane by a shuffle (src: its lane index; every lane of the warp runs the load). The codes come out of the window's
+// four words by a per-lane word select and the same funnel shifts: the same raw words as W, so the same result bit for bit
+template <bool Q8, bool W = false, int P = 0, bool X = false>
+static __device__ __forceinline__ uint4 ld_row8(const char * p, const int off, const int src = 0) {
+    if constexpr (Q8 && X) {
+        (void) off; (void) src;
+        return make_uint4(0, 0, 0, 0); // not used: the X path loads through ld_row8c
+    } else if constexpr (Q8) {
+        (void) src;
+        if constexpr ((P & 1) != 0) {
+            // timing probe, wrong output: one aligned 4-byte load a lane, the load count of the F16 path
+            const uint32_t w0 = __ldg((const uint32_t *)((uintptr_t)(p + 2 + off) & ~(uintptr_t) 3));
+            return make_uint4(w0, w0, w0 & 0xffffu, 0);
+        }
         const uint32_t d = (uint32_t) __ldg((const unsigned short *) p);
         if constexpr (W) {
             const uintptr_t s = (uintptr_t)(p + 2 + off);
@@ -99,12 +113,50 @@ static __device__ __forceinline__ uint4 ld_row8(const char * p, const int off) {
     }
 }
 
+// [TAG_FVS_Q8_LD3] a lane's Q8_0 load with everything about its place in the row worked out once per thread: the three
+// aligned 4-byte words that hold its 8 codes at fixed offsets from the block (o0, o1, o2), their funnel shift (sh: 0, 16 or
+// 32 bits), and the block's d. The lane with the block's first codes starts its window on the word that holds d (the two
+// bytes before those codes), so its first word carries d (dsh bits up); with SD the block's other three lanes take d
+// from that lane by a shuffle (src) instead of loading it, which leaves three loads a lane. Rows must be a multiple of 4
+// bytes apart (they are 272), so one row's alignment is every row's. The same raw words as ld_row8 gives, bit for bit
+struct q8ld_t {
+    int o0, o1, o2;
+    uint32_t sh, dsh;
+    int src;
+};
+static __device__ __forceinline__ q8ld_t q8ld_make(const char * p, const int off, const int src) {
+    const bool first = off == 0;
+    const uintptr_t s = (uintptr_t)(p + (first ? 0 : 2 + off));
+    const uint32_t  o = (uint32_t)(s & 3) + (first ? 2u : 0u);   // the codes' byte offset in the window: 0, 2 or 4
+    q8ld_t c;
+    c.o0  = (int)((s & ~(uintptr_t) 3) - (uintptr_t) p);
+    c.o1  = c.o0 + 4;
+    c.o2  = c.o0 + (o != 0 ? 8 : 4);   // aligned codes need two words: the third load re-reads the second
+    c.sh  = 8*o;
+    c.dsh = 8*(uint32_t)((uintptr_t) p & 3);
+    c.src = src;
+    return c;
+}
+template <bool SD>
+static __device__ __forceinline__ uint4 ld_row8c(const char * p, const q8ld_t & c) {
+    const uint32_t w0 = __ldg((const uint32_t *)(p + c.o0)), w1 = __ldg((const uint32_t *)(p + c.o1)), w2 = __ldg((const uint32_t *)(p + c.o2));
+    uint32_t d;
+    if constexpr (SD) {
+        d = __shfl_sync(0xffffffffu, w0 >> c.dsh, c.src) & 0xffffu;
+    } else {
+        d = (uint32_t) __ldg((const unsigned short *) p);
+    }
+    return make_uint4(__funnelshift_rc(w0, w1, c.sh), __funnelshift_rc(w1, w2, c.sh), d, 0);
+}
+
 // what ld_row8 returned, as 8 F16 values. Q8_0: each int8 code q is biased to an unsigned byte and placed under the F16
 // exponent of 1024 (0x64xx = 1024 + q + 128, exact), 1152 is taken off (exact: q itself) and the product with d is the one
 // rounding
-template <bool Q8>
+template <bool Q8, int P = 0>
 static __device__ __forceinline__ uint4 to_f16x8(const uint4 r) {
-    if constexpr (Q8) {
+    if constexpr (Q8 && (P & 2) != 0) {
+        return make_uint4(r.x & 0x3bff3bffu, r.y & 0x3bff3bffu, r.x & 0x3bff3bffu, r.y & 0x3bff3bffu); // timing probe, wrong output: no widening (finite halves)
+    } else if constexpr (Q8) {
         const half2  d    = __half2half2(__ushort_as_half((unsigned short) r.z));
         const half2  bias = __half2half2(__ushort_as_half((unsigned short) 0x6480)); // 1152
         const uint32_t a  = r.x ^ 0x80808080u;
@@ -210,6 +262,9 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
     const bool isQK = w < 4;
     constexpr int KP = VAR & 31, KQ = 16 - KP;
     constexpr bool Q8W = (VAR & 32) != 0;   // VAR & 32: the Q8_0 codes as aligned-window loads (ld_row8)
+    constexpr int  Q8P = (VAR >> 6) & 3;    // VAR & 192: timing probes with wrong output (1: one load a lane, 2: no widening, 3: both)
+    constexpr bool Q8X  = KVQ8 && (VAR & 768) != 0;   // VAR & 256: the Q8_0 loads at per-thread offsets, d by shuffle (ld_row8c, [TAG_FVS_Q8_LD3])
+    constexpr bool Q8SD = (VAR & 256) != 0;            // VAR & 512: the same offsets, d loaded
 
     // this block's 8-token half; Q, the mask and the outputs from its first token on
     const int hf    = blockIdx.x % nhalf;
@@ -277,6 +332,10 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
     const int kq   = 8*(lane & 3);
     const int vq   = vd & 31;
     const char * Vbase = V + kvh*nbv2 + (int64_t) l4*nbv1 + (KVQ8 ? 34*(vd >> 5) : 2*vd);
+    // [TAG_FVS_Q8_LD3] the lane with the first codes of this lane's block: lane & 28 in a K row, lane & 11 in a V row (the
+    // same row l4 and block, the block's first 8 dims)
+    const q8ld_t kld = q8ld_make(Kbase + kofs, kq, lane & 28);
+    const q8ld_t vld = q8ld_make(Vbase, vq, lane & 11);
 
     // The two groups have separate loops (their register state is disjoint); both cross the same barriers nt + 2 times.
     if (isQK) {
@@ -290,14 +349,14 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
             {
                 const char * kp = Kbase + (key0(0) + w)*nbk1 + kofs;
 #pragma unroll
-                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
+                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = (Q8X ? ld_row8c<Q8SD>(kp, kld) : ld_row8<KVQ8, Q8W, Q8P>(kp, kq));
             }
 #pragma unroll
-            for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
+            for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8, Q8P>(kreg[rr]);
             if (nt > 1) {
                 const char * kp = Kbase + (key0(1) + w)*nbk1 + kofs;
 #pragma unroll
-                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
+                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = (Q8X ? ld_row8c<Q8SD>(kp, kld) : ld_row8<KVQ8, Q8W, Q8P>(kp, kq));
             }
         }
         __syncthreads();
@@ -415,12 +474,12 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                 // the next K tile (loaded one iteration ago) into shared memory, then the one after it into registers
                 if (has_next) {
 #pragma unroll
-                    for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
+                    for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8, Q8P>(kreg[rr]);
                     if (tid < 64) *(uint4 *) &s.M[b ^ 1][(tid >> 3)*MST + 8*(tid & 7)] = mnext;
                     if (KQ > 0 && j + 2 < nt) {
                         const char * kp = Kbase + (key0(j + 2) + w)*nbk1 + kofs;
 #pragma unroll
-                        for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
+                        for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = (Q8X ? ld_row8c<Q8SD>(kp, kld) : ld_row8<KVQ8, Q8W, Q8P>(kp, kq));
                     }
                 }
             }
@@ -470,7 +529,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
         if (nt > 0) {
             const char * vp = Vbase + key0(0)*nbv1;
 #pragma unroll
-            for (int q = 0; q < 16; ++q, vp += 4*nbv1) vreg[q] = ld_row8<KVQ8, Q8W>(vp, vq);
+            for (int q = 0; q < 16; ++q, vp += 4*nbv1) vreg[q] = (Q8X ? ld_row8c<Q8SD>(vp, vld) : ld_row8<KVQ8, Q8W, Q8P>(vp, vq));
         }
         if constexpr (KP > 0) {   // the PV group owns the last KP rows of the K tile's load and its store to shared memory
             const int wk = w & 3;
@@ -478,14 +537,14 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                 {
                     const char * kp = Kbase + (key0(0) + wk + 4*KQ)*nbk1 + kofs;
 #pragma unroll
-                    for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
+                    for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = (Q8X ? ld_row8c<Q8SD>(kp, kld) : ld_row8<KVQ8, Q8W, Q8P>(kp, kq));
                 }
 #pragma unroll
-                for (int rr = 0; rr < KP; ++rr) *(uint4 *) &s.K[(4*(KQ + rr) + wk)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
+                for (int rr = 0; rr < KP; ++rr) *(uint4 *) &s.K[(4*(KQ + rr) + wk)*KST + 8*lane] = to_f16x8<KVQ8, Q8P>(kreg[rr]);
                 if (nt > 1) {
                     const char * kp = Kbase + (key0(1) + wk + 4*KQ)*nbk1 + kofs;
 #pragma unroll
-                    for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
+                    for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = (Q8X ? ld_row8c<Q8SD>(kp, kld) : ld_row8<KVQ8, Q8W, Q8P>(kp, kq));
                 }
             }
         }
@@ -515,10 +574,10 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
 #ifndef FVS_SKIP_PV
 #pragma unroll
                 for (int c = 0; c < TK/8; ++c) {
-                    const uint4 v0 = to_f16x8<KVQ8>(vreg[2*c]), v1 = to_f16x8<KVQ8>(vreg[2*c + 1]);
+                    const uint4 v0 = to_f16x8<KVQ8, Q8P>(vreg[2*c]), v1 = to_f16x8<KVQ8, Q8P>(vreg[2*c + 1]);
                     if (has_next) {
-                        vreg[2*c]     = ld_row8<KVQ8, Q8W>(vp, vq);
-                        vreg[2*c + 1] = ld_row8<KVQ8, Q8W>(vp + 4*nbv1, vq);
+                        vreg[2*c]     = (Q8X ? ld_row8c<Q8SD>(vp, vld) : ld_row8<KVQ8, Q8W, Q8P>(vp, vq));
+                        vreg[2*c + 1] = (Q8X ? ld_row8c<Q8SD>(vp + 4*nbv1, vld) : ld_row8<KVQ8, Q8W, Q8P>(vp + 4*nbv1, vq));
                     }
                     vp += 8*nbv1;
 #pragma unroll
@@ -537,11 +596,11 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                     const int wk = w & 3;
                     asm volatile("bar.sync 2, 256;" ::: "memory");   // every QK warp is done reading the K tile
 #pragma unroll
-                    for (int rr = 0; rr < KP; ++rr) *(uint4 *) &s.K[(4*(KQ + rr) + wk)*KST + 8*lane] = to_f16x8<KVQ8>(kreg[rr]);
+                    for (int rr = 0; rr < KP; ++rr) *(uint4 *) &s.K[(4*(KQ + rr) + wk)*KST + 8*lane] = to_f16x8<KVQ8, Q8P>(kreg[rr]);
                     if (j + 2 < nt) {
                         const char * kp = Kbase + (key0(j + 2) + wk + 4*KQ)*nbk1 + kofs;
 #pragma unroll
-                        for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = ld_row8<KVQ8, Q8W>(kp, kq);
+                        for (int rr = 0; rr < KP; ++rr, kp += 4*nbk1) kreg[rr] = (Q8X ? ld_row8c<Q8SD>(kp, kld) : ld_row8<KVQ8, Q8W, Q8P>(kp, kq));
                     }
                 }
             }

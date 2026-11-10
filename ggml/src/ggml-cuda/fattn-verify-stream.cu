@@ -162,7 +162,27 @@ void ggml_cuda_flash_attn_ext_verify_stream(ggml_backend_cuda_context & ctx, ggm
     static const bool q8_kp8 = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_KP"); return e && atoi(e) != 0; }();
     static const bool q8_w   = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_W");  return !e || atoi(e) != 0; }();
     const bool kv_q8 = K->type == GGML_TYPE_Q8_0;
-    (kv_q8 ? (q8_w ? (q8_kp8 ? fvs::verify_stream<6, false, 40, true> : fvs::verify_stream<6, false, 32, true>)
+    // timing probes of the Q8_0 path, wrong output (LLAMA_FATTN_VERIFY_STREAM_Q8_PROBE = 1: one load a lane, 2: no widening, 3: both)
+    static const int q8_probe = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_PROBE"); return e ? atoi(e) & 3 : 0; }();
+    if (kv_q8 && q8_probe != 0) {
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 +  64, true>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 128, true>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 192, true>), nbytes_shared);
+    }
+    // [TAG_FVS_Q8_LD3] LLAMA_FATTN_VERIFY_STREAM_Q8_LD = 1: the Q8_0 loads at per-thread offsets with d from the block's
+    // first lane by a shuffle (three loads a lane); 2: the same offsets, d loaded (four). KP 0 both
+    static const int q8_ld = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_LD"); return e ? atoi(e) : 0; }();
+    if (kv_q8 && q8_ld != 0) {
+        GGML_ASSERT(K->nb[1] % 4 == 0 && V->nb[1] % 4 == 0);
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 256, true>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 512, true>), nbytes_shared);
+    }
+    (kv_q8 && q8_probe == 0 && q8_ld == 1 ? fvs::verify_stream<6, false, 32 + 256, true> :
+     kv_q8 && q8_probe == 0 && q8_ld == 2 ? fvs::verify_stream<6, false, 32 + 512, true> :
+     kv_q8 && q8_probe == 1 ? fvs::verify_stream<6, false, 32 +  64, true> :
+     kv_q8 && q8_probe == 2 ? fvs::verify_stream<6, false, 32 + 128, true> :
+     kv_q8 && q8_probe == 3 ? fvs::verify_stream<6, false, 32 + 192, true> :
+     kv_q8 ? (q8_w ? (q8_kp8 ? fvs::verify_stream<6, false, 40, true> : fvs::verify_stream<6, false, 32, true>)
                    : (q8_kp8 ? fvs::verify_stream<6, false,  8, true> : fvs::verify_stream<6, false,  0, true>)) :
      stub  ? fvs::verify_stream<6, true> : kp8 ? fvs::verify_stream<6, false, 8> : fvs::verify_stream<6, false>)<<<dim3(nsplit*nkvh*nhalf, n_strm, 1), fvs::NTH, nbytes_shared, stream>>>(
         (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
