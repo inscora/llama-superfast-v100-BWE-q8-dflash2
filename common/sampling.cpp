@@ -1162,11 +1162,13 @@ void common_sampler_accept_draft(struct common_sampler * gsmpl, llama_token toke
 
 // the row can take the rejection step: no reasoning budget forcing its end sequence, and no grammar that applies
 // (a lazy grammar awaiting its trigger changes no row). the state is read per row, after the tokens accepted before it
-// [TAG_SPEC_REJECTION_GRAMMAR] with LLAMA_SPEC_REJECTION_GRAMMAR (default on, 0: off) a row under a grammar that
-// applies (a tool call's body, a JSON schema) can take the step too, see common_sampler_rejection_grammar_fit
-static bool common_sampler_rejection_grammar() {
-    static const bool v = [] { const char * e = getenv("LLAMA_SPEC_REJECTION_GRAMMAR"); return e == nullptr || atoi(e) != 0; }();
-    return v;
+// [TAG_SPEC_REJECTION_GRAMMAR] LLAMA_SPEC_REJECTION_GRAMMAR (default 1): a row under a lazy grammar that has
+// triggered (a tool call's body) can take the step too, see common_sampler_rejection_grammar_fit. 2: under any grammar
+// that applies (a JSON schema's costs more to read than the step gains: 4% of the decode rate on a schema of 12
+// fixed objects). 0: no row under a grammar, as before. Never at temperature 0, where the step cannot gain
+static bool common_sampler_rejection_grammar(const struct common_sampler * gsmpl) {
+    static const int v = [] { const char * e = getenv("LLAMA_SPEC_REJECTION_GRAMMAR"); return e == nullptr ? 1 : atoi(e); }();
+    return v != 0 && gsmpl->params.temp > 0.0f && (v >= 2 || gsmpl->params.grammar_lazy);
 }
 
 static bool common_sampler_grammar_applies(const struct common_sampler * gsmpl) {
@@ -1174,7 +1176,7 @@ static bool common_sampler_grammar_applies(const struct common_sampler * gsmpl) 
 }
 
 static bool common_sampler_rejection_row_ok(const struct common_sampler * gsmpl) {
-    return gsmpl->rbudget_topk_ok() && (common_sampler_rejection_grammar() || !common_sampler_grammar_applies(gsmpl));
+    return gsmpl->rbudget_topk_ok() && (!common_sampler_grammar_applies(gsmpl) || common_sampler_rejection_grammar(gsmpl));
 }
 
 // [TAG_SPEC_REJECTION_GRAMMAR] the candidates of cur_p that carry probability, through the grammar that applies.
