@@ -871,3 +871,45 @@ the PV warps' product loop, their reads and their widening (one read a lane on V
 and the QK warps have room. A probe that has the QK warps load and widen 3/8 of each V tile into shared memory as F16,
 the PV warps reading it with one load, runs in 429 us (4/8: 431, 5/8: 443): about 8.5% of the kernel, which is 2% of a
 round at 100k and 3% at 200k. The exact version needs the V part's hand-over between the two groups.
+
+## 32. The verify kernel on a Q8_0 cache: the V widening shared between the warp groups, and a cheaper tile list (branch q8-fvs)
+
+Measured 2026-11-10 with `test-backend-ops perf` (4 KV heads x 6, 65,536 keys, 8 tokens, Q8_0), each variant
+alternated with the kernel as it was, then on the server with fixed requests whose outputs must be identical.
+
+| kernel | us a call |
+|---|---|
+| as it was (section 31) | 463-471 |
+| the V widening shared (`TAG_FVS_Q8_VB`) | 440-442 |
+| the fast tile list (`TAG_FVS_SKIP_FAST`) | 450 |
+| both (the default now) | 426 |
+| no tile list at all (`LLAMA_FATTN_VERIFY_STREAM_SKIP=0`), V shared | 412 |
+
+**The V widening shared** (`LLAMA_FATTN_VERIFY_STREAM_Q8_VB`, 3 by default; 2 or 4: another share; 0: off). Section
+31's probe built exactly. The QK warps load and widen the first 3/8 of each V tile (24 rows, all 256 dims, a lane
+taking the 8 dims it takes of a K row) into shared memory as F16; the PV warps read those rows as fragments with one
+load each and widen only the other 40 themselves. The words, the widening and the product order are the PV warps'
+own, so the output is the same bit for bit. The part has one buffer, handed over at a named barrier: a PV warp
+consumes the previous tile's part first in its iteration and arrives; a QK warp, its P written, waits there for the
+four PV warps before it lays down the next tile's. Shares 2 and 3 measure the same (442-447), 4 is slower (457): the
+QK warps become the slow group. The barrier costs nothing (the same kernel without it, wrong output: 441-444), and
+two buffers with no barrier (`_VB_MODE=2`, share 2 only: two buffers of 3/8 do not fit a block's shared memory)
+442. The probe's 429-432 is not reached, by 10 us, with the loads and stores in the probe's own order and place
+and with the tile list off as well (412 against 401): what the probe gains beyond the exact kernel is not found.
+
+**The tile list** (`LLAMA_FATTN_VERIFY_STREAM_SKIP_FAST`, default on; 0: as before). The list of used tiles
+(`TAG_FVS_SKIP`) lets a batch of several conversations read only its own cells. On one conversation every tile is
+used and the list is pure cost, and it was 25 us of a 465 us call (made and not used, `_SKIP=2`: 462; not made: 437;
+reading it in the kernel: nothing). One block of 256 threads read every 8-key chunk of every row, 32 dependent loads
+a thread, and one warp compacted the flags tile after tile. Now the block has 1024 threads; every tile is first
+tried on one chunk (its first, in the half's last row), and only the tiles that chunk leaves open are read in full;
+and every warp compacts its 32 tiles at once, its place in the list from the counts of the warps before it. The same
+list in the same order. 450 us with it: 13 us are left over the kernel with no list, part of it the launch itself
+(the perf test launches without a CUDA graph). Not done: one list for all the layers of a round (they share the mask).
+
+**Checked.** The Q8_0 eval cases against the CPU reference: 39 of 39, share 3 three passes, then both changes two
+passes. On the server (dev build, 4 slots, unified cache), the 17 shallow requests and the 4 at 100k of section 30's
+probe, the kernel as it was (`_SKIP_FAST=0 _Q8_VB=0`) against the defaults, two alternating passes at 100k: every
+output identical, no errors. Decode at 100k: 122.8 / 122.5 -> 124.2 / 124.3 tok/s (verbatim copy), 127.7 / 125.9 ->
+129.2 / 127.8 (write call, temperature 1), 109.0 / 108.9 -> 110.3 / 110.4 (prose, temperature 1): +1.1 to +1.5%.
+Shallow requests are unchanged (the kernel is a small share there).
