@@ -13,8 +13,12 @@
 
 #include "llama.h"
 
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <random>
 #include <string>
+#include <vector>
 
 static int n_fail = 0;
 
@@ -129,6 +133,55 @@ int main(int argc, char ** argv) {
         common_sampler * d = common_sampler_clone(s);
         check(throws(d, im_start), "control: the grammar still applies after the fitting tokens");
         common_sampler_free(d);
+        common_sampler_free(s);
+    }
+
+    // 5. [TAG_SPEC_REJECTION_GRAMMAR] the draft's pick under the triggered grammar: q holds only candidates that fit,
+    // sums to 1, and the picked token is one of them; with nothing that fits there is no pick and no q
+    {
+        common_params_sampling sq = sp;
+        sq.temp = 1.0f;
+        common_sampler * s = common_sampler_init(model, sq);
+        accept_all(s, open, true);
+        accept_all(s, tok("abc"), true);
+        const auto fit   = tok("x");
+        const auto close = tok("</tool_call>");
+        check(fit.size() == 1, "the vocab spells x in one token");
+        const bool on = getenv("LLAMA_SPEC_REJECTION_GRAMMAR") == nullptr || atoi(getenv("LLAMA_SPEC_REJECTION_GRAMMAR")) != 0;
+        if (fit.size() == 1 && common_sampler_rejection_ok(s)) {
+            std::mt19937 gen(7);
+            std::vector<llama_token_data> cand = { { im_start[0], 3.0f, 0.0f }, { fit[0], 2.0f, 0.0f }, { close[0], 1.0f, 0.0f }, { im_end[0], 0.5f, 0.0f } };
+            const llama_token_data_array cand_p = { cand.data(), cand.size(), -1, true };
+            common_sampler * c = common_sampler_clone(s);
+            common_rejection_q q;
+            llama_token forced = LLAMA_TOKEN_NULL;
+            const llama_token id = common_sampler_rejection_draft(c, nullptr, &cand_p, 0.0f, q, &forced, &gen);
+            if (on) {
+                float sum = 0.0f;
+                bool only_fit = !q.empty();
+                bool has_id = false;
+                for (const auto & e : q) {
+                    sum += e.p;
+                    only_fit = only_fit && (e.id == fit[0] || e.id == close[0]);
+                    has_id = has_id || e.id == id;
+                }
+                check(id != LLAMA_TOKEN_NULL && has_id, "the draft picks a token of q under the triggered grammar");
+                check(only_fit, "q holds only the candidates that fit the grammar");
+                check(std::fabs(sum - 1.0f) < 1e-4f, "q sums to 1 after the candidates that do not fit are dropped");
+                check(!throws(c, { id }), "the picked token is accepted by the grammar");
+            } else {
+                check(id == LLAMA_TOKEN_NULL && q.empty(), "LLAMA_SPEC_REJECTION_GRAMMAR=0: no pick under the triggered grammar, as before");
+            }
+            common_sampler_free(c);
+
+            std::vector<llama_token_data> bad = { { im_start[0], 3.0f, 0.0f }, { im_end[0], 0.5f, 0.0f } };
+            const llama_token_data_array bad_p = { bad.data(), bad.size(), -1, true };
+            common_sampler * d = common_sampler_clone(s);
+            q.clear();
+            const llama_token none = common_sampler_rejection_draft(d, nullptr, &bad_p, 0.0f, q, &forced, &gen);
+            check(none == LLAMA_TOKEN_NULL && q.empty(), "no candidate fits: no pick and an empty q");
+            common_sampler_free(d);
+        }
         common_sampler_free(s);
     }
 

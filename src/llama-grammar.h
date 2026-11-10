@@ -3,6 +3,7 @@
 #include "llama.h"
 
 #include <map>
+#include <memory>
 #include <regex>
 #include <string>
 #include <vector>
@@ -130,7 +131,9 @@ struct llama_grammar {
     // note: allow null vocab for testing (not great)
     const llama_vocab * vocab;
 
-    const llama_grammar_rules  rules;  // TODO: shared ptr
+    // [TAG_GRAMMAR_SHARED_RULES] the rules never change after init, so a clone shares them: the stacks' element pointers
+    // stay valid in every clone and nothing is copied or redirected (llama_grammar_clone_impl)
+    const std::shared_ptr<const llama_grammar_rules> rules;
           llama_grammar_stacks stacks;
 
     // buffer for partially generated UTF-8 sequence from accepted tokens

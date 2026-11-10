@@ -685,6 +685,13 @@ morning): 128,009 tokens in 203.5 s (629 tok/s; rsZ 205.8 s, 622), 243,576 token
 earlier points (818 tok/s at 64k, 538 at 180k, 505-509 at 200k): the cap changes nothing on a cold prefill, which runs
 in 2,048-row chunks on gqa6 either way.
 
+The same two prefills with the card's 200 W power limit removed (2026-11-08, rsAB, the card at its 250 W board rating
+under a new fan at full speed; `pf2u.sh`, the same fresh-container method): 128,009 tokens in 183.9 s (696 tok/s, +11%),
+243,576 in 472.4 s (516 tok/s, +12%). The card drew 231-233 W on average through them, sat at the board limit on
+25-33% of the 2-second samples (peaks 265-279 W), and topped out at 62-64 C, against 72 C under the old fan at 200 W.
+Deep prefill is now bound by the board's own power limit, not by a cap; BetterBench's 1.5k-47k prefills gained 8-10%
+the same way and its decode did not move (it draws about 180 W).
+
 ## 28. The attention's structure at depth (branch attn-depth)
 
 The question from section 27: with the attention at 61% of a 174k prefill and 70% at 244k, and the gqa6 route at 42
@@ -838,3 +845,130 @@ batches).
 Launch, when the files are in place: `PHASE=mtp KV_TYPE=f16 DRAFT_N_MAX=2 MODEL_DIR=<dir> MODEL_FILE=<model.gguf>
 MTP_FILE=<mtp.gguf> ./run-superfast.sh` (the `dflash` phase needs a DFlash2 draft, which the line does not have;
 `KV_TYPE=q8_0` would be replaced by F16 with the warning above).
+
+## 30. Host work in the decode round (2026-11-09: decode +0.4 to +0.8%, outputs identical)
+
+A review of the decode round on 2026-11-09 (the card was off; section 29 is the `qwen4` branch's). The round is GPU
+bound: 94% busy, 81% of that in the weight kernels (the 2026-10-23 profile). What the host adds is small, and most of
+it hides under the drafter's injection, about 1.9 ms of GPU time issued after each verify. It shows when the host
+window is longer than that: requests with a tool list, whose sampler clones are heavy, and deep conversations. Four
+changes, each exact (the served tokens do not change) and each behind a switch that restores the previous code:
+
+- **A clone of a grammar shares its rules** (`TAG_GRAMMAR_SHARED_RULES`, `LLAMA_GRAMMAR_SHARE_RULES=0` copies). The
+  rules never change after init (upstream's own `TODO: shared ptr`). A clone copied every rule, then compared every
+  stack element with every rule element to redirect its pointers, a loop with no break: stack elements x rule
+  elements comparisons a clone. A speculative round clones the sampler for the draft's rejection picks and for the
+  block verification. Now the clone holds
+  the same `shared_ptr` and its copied stacks already point into it. `test-grammar-integration` gains `test_clone`
+  (a clone taken mid-input: the same stacks, its own progress, a clone of a clone, a clone outliving its source).
+- **The sampler's saved copy is cloned only when it can be read** (`TAG_SPEC_SAVE_LAZY`, `LLAMA_SPEC_SMPL_SAVE=1`
+  clones every round). The copy is read on one branch, a partial acceptance that restores the checkpoint, which needs
+  a rollback deeper than the context supports. At most n_draft tokens roll back, so with a recurrent target at an
+  n-max within the rollback depth (every production round) the branch is unreachable and the third clone of the round
+  was dead work.
+- **The slot's tokens are copied for the draft only when something reads the copy** (`TAG_SPEC_PROMPT_LAZY`,
+  `LLAMA_SPEC_PROMPT_COPY=1` copies every round). `spec_prompt` was rebuilt every round, one pass over every token of
+  the conversation; its readers are the ngram drafters and the lookup of section 25
+  (`common_speculative_needs_prompt`). A draft model keeps its own state.
+- **The drafter's injection is issued with the target's decode** (`TAG_SPEC_PROCESS_EARLY`,
+  `LLAMA_SPEC_PROCESS_EARLY=0` restores the two yields). `common_speculative_process` ran in a queue yield of its own
+  after the target's synchronize, the metrics in between: the GPU sat idle from the end of the verify graph until the
+  injection's host preparation was done. It now runs in the decode's yield, before the synchronize. It needs nothing
+  the synchronize delivers: the feature rows go device to device, copied on the target's stream behind its graph, and
+  the drafter's stream waits on that copy's event; the host path's getter synchronizes itself. DFlash drafters only
+  (`common_speculative_process_early_ok`); `LLAMA_TU_DIAG` keeps the two yields.
+
+Verified here: the CPU and CUDA servers build; `test-grammar-integration`, `test-llama-grammar`,
+`test-grammar-parser`, `test-json-schema-to-grammar`, `test-chat`, `test-chat-auto-parser`, `test-chat-peg-parser`,
+`test-chat-template`, `test-sampling`, `test-spec-rejection`, `test-spec-draft-grammar` and `test-reasoning-budget`
+pass with the defaults and with `LLAMA_GRAMMAR_SHARE_RULES=0`.
+
+Measured on the card on 2026-11-09 (the V100 uncapped, production's launcher settings, `~/src/q8bench/hc.sh`,
+results in `results/hc/`). The probe `hcprobe.py` sends 21 fixed requests on one slot, each at temperature 0 or at
+temperature 1.0 with a fixed seed: plain chat, a five-turn agent loop with a 14-tool list, a JSON schema, a 1,400-token
+file written through a tool call, and a 99,645-token conversation with a verbatim copy, a tool-call write and prose
+on top. Three servers ran it with the round timers on: this build with the switches at their defaults (new), this
+build with the four switches restored (old), and the previous build.
+
+- Outputs: all 21 requests are identical, character for character, across the three, and across six more passes
+  without timers (new and old alternating, three each). No assert or CUDA error in any log; 65 C at most.
+- Round time, new against old, microseconds of host round on the same rounds (the outputs being identical, the two
+  ran the same rounds): plain chat 41,185 -> 41,026 (-0.4%), the agent loop 42,390 -> 42,050 (-0.8%), the tool-call
+  write 42,050 -> 41,740 (-0.75%), the JSON schema 48,370 -> 47,380 (-2.0%), 100k deep 51,640 -> 51,230 (-0.8%).
+  GPU busy time is unchanged; the idle time between graphs falls by 0.2 to 0.6 ms a round. The old code and the
+  previous build agree within 0.1% on every request: the switches do restore it.
+- Decode rate over the alternating passes (three each, ranges that do not overlap on any request but each
+  server's first): plain +0.4%, the agent loop +0.7%, the tool-call write +0.7% (142.6 against 141.6 tok/s), the JSON
+  schema +2.1% (90.9 against 89.0).
+- Where it comes from. Sampler clones a round: 3 -> 2 without a grammar, 2 -> 1 with one. A clone with the 14-tool
+  grammar costs 20 us instead of 60 (`cs.clone` 120 -> 20 us a round); with the schema's grammar about 530 us
+  either way, because there the stacks are the cost, not the rules. The early injection does not overlap the verify:
+  the drafter's decode synchronizes its own stream while it prepares, and that stream waits on the copy behind the
+  target's graph, so `spec.process` now blocks for the verify's 34 ms and the synchronize after it finds the work
+  done. What it saves is the hand-off: the gap from the target's graph to the drafter's injection falls from
+  286-311 us to 102-106 us a round on every request. The gap from the injection to the draft falls with the clones
+  (357 -> 280 us in the tool-call write) and, at 100k, with the token copy (556 -> 355 us).
+- Several slots at once (`hcconc.sh`, `hcconc2.sh`): a 21k-token prompt read beside a generating slot gives the
+  same two outputs on new and old, four runs out of four. Three slots decoding greedily at once are not repeatable
+  on any build: of eight runs each against one reference, old matched in three, new in two, the previous build in
+  four, always at the same few positions (tokens 35, 36, 70, 120, 191), which move with the order the requests
+  arrive in. No error in any of them.
+- Seen on the way, not part of this change: with the JSON schema (an array of exactly 12 objects) the grammar work
+  of a round takes 6.3 to 7 ms (`srv.accept_block`), against 0.3 ms inside a tool call's body, and the round's idle
+  time is 9 ms against 2. Acceptance in the tool-call bodies was 70% shallow and 80% at 100k.
+
+Left out, from the same review: the next draft launched right after the acceptance (the host work it would hide
+already runs under the injection), the forward's 96 ring `set_rows` fused into the conv-slots launch (a CUDA kernel
+change, 0.3-0.6 ms, to write with the card at hand and `LLAMA_RS_REPLAY_SELFTEST`), the graph compatibility walk
+cached per uid (20-50 us). Two findings of the review are not host work and are not in this branch: a drafted row
+loses the rejection step once a tool call's grammar has triggered (`common_sampler_rejection_row_ok`), and the
+streaming verify kernel reads a Q8_0 cache at about 306 GB/s where it reads an F16 one at 659 (section 1's numbers).
+
+## 31. Rejection sampling inside tool calls, and the graph check kept per graph (2026-11-09: tool-call bodies +4.5%, decode +0.3 to +0.4%)
+
+Two of the review's items of section 30, measured on 2026-11-09 with the same method (fixed requests, identical outputs
+where the change is exact, alternating servers).
+
+**The rejection step under a tool call's grammar** (`TAG_SPEC_REJECTION_GRAMMAR`, `LLAMA_SPEC_REJECTION_GRAMMAR`,
+default 1; 0: as before; 2: under any grammar). Once a lazy grammar had triggered, a drafted row lost the rejection
+step: the draft proposed its argmax and the verify sampled the target and compared, so a tool call's body, where a
+coding agent writes its files, decoded on the sample-and-match rule (with `LLAMA_SPEC_REJECTION=0` its output did not
+change by a token). `common_sampler_sample` draws from the chain and keeps the token when it fits the grammar; only a
+token that does not fit sends it to a second draw with the grammar first. So on a row where every candidate with
+probability fits the grammar, the chain's distribution is the row's distribution, and the rejection step is exact
+there. Now such a row takes the step (the token step and the block verification both), the draft's q is its candidates
+that fit, renormalized, and a row with a candidate that does not fit keeps the two draws. Not at temperature 0 (the
+step cannot gain there) and by default not under a grammar that is not lazy: a JSON schema's grammar costs more to
+read than the step gains (a schema of 12 fixed objects lost 4% with it, 86.9 against 90.7 tok/s).
+- The write-tool task of section 30's probe at temperature 1.0, eight seeds: 142.0 tok/s against 135.8 (+4.5%),
+  acceptance 0.710 against 0.669. Every row read through the grammar had only candidates that fit (3,082 of 3,082 in
+  the first three seeds), so no row fell back.
+- For scale: the same file written as plain content decodes at 160 tok/s with the rejection step (acceptance 0.787)
+  and 143 without (0.699); the tool call's JSON string is harder for the draft.
+- The distribution is the target's: over 60 seeds the first tool called was write 51, grep 8, glob 1 with the step and
+  50, 9, 1 without. The greedy requests and every request without tools give the outputs of the previous build,
+  character for character; a seeded request with tools gives another sample of the same distribution, as the
+  rejection step always did for plain text.
+- `test-spec-draft-grammar` checks the draft's pick under a triggered grammar (q holds only candidates that fit, sums
+  to 1, the pick is accepted by the grammar; nothing fits: no pick).
+
+**The graph compatibility walk kept per graph uid** (`TAG_CG_COMPAT_CACHE`, `LLAMA_CG_COMPAT_CACHE=0` walks every
+time). Before each launch the backend walked every node of the graph to decide whether it may run as a CUDA graph:
+98.5 us on the verify graph's 4,574 nodes, 17 us on each of the drafter's two, all before the launch, the GPU idle.
+The answer depends on the nodes' ops, shapes and weights only, so a graph with the uid the walk last ran on keeps its
+answer (the reuse `ggml_cuda_graph_update_required` already trusts). Outputs identical on the 17 requests; the walk
+falls to 1 us a round, the host round by 118 us (41,716 -> 41,598), and the decode rate rises 0.3 to 0.4% on every
+request in two alternating passes each (143.6 against 143.2 tok/s on the tool-call write).
+
+Measured and not built: the forward's ring writes. An nsys node trace of decode shows 96 `k_set_rows` a round at
+3.1 us each on the target's stream, 0.3 ms a round, 0.7%: the ceiling of fusing them, half in the conv-slots kernel
+(the x ring) and half in the gated delta net kernel (the alpha/beta ring).
+
+The streaming verify kernel on a Q8_0 cache (branch `q8-fvs`, experiments, all off): 462-473 us a call at 65,536 keys
+x 8 tokens, an F16 cache 394-399. Fewer or wider loads do not help (two 8-byte loads with a word select 502-506; the
+scale by a shuffle 476-481; per-thread offsets 461-467), and neither does reading each row from global memory once
+with the raw rows staged in shared memory (K rows 462, V rows 462-468, both exact). The probes say why: the time is in
+the PV warps' product loop, their reads and their widening (one read a lane on V alone: 375; no widening on V: 432),
+and the QK warps have room. A probe that has the QK warps load and widen 3/8 of each V tile into shared memory as F16,
+the PV warps reading it with one load, runs in 429 us (4/8: 431, 5/8: 443): about 8.5% of the kernel, which is 2% of a
+round at 100k and 3% at 200k. The exact version needs the V part's hand-over between the two groups.

@@ -118,6 +118,9 @@ void common_sampler_set_backend_topk(struct common_sampler * gsmpl, const struct
 
 // rows sampled with backend top-k candidates, and how many of those fell back to the full logits
 void common_sampler_backend_topk_stats(const struct common_sampler * gsmpl, uint64_t * n_rows, uint64_t * n_full);
+// [TAG_SPEC_REJECTION_GRAMMAR] the verify's rows read through a grammar that applies for the rejection step, and
+// those of them with a candidate that does not fit it (they keep the two-draw sampling)
+void common_sampler_rejection_grammar_stats(const struct common_sampler * gsmpl, uint64_t * n_rows, uint64_t * n_unfit);
 
 // [TAG_SPEC_COUPLED] coupled drafting: a copy of the target's sampler (common_sampler_clone) picks a
 // draft token from the draft's candidates with the random draw the target's own sample will take at that row.

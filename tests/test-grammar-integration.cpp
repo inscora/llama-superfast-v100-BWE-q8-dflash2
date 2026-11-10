@@ -1478,6 +1478,55 @@ static void test_json_schema() {
     );
 }
 
+// [TAG_GRAMMAR_SHARED_RULES] a clone taken mid-input has the original's stacks, continues the input on its own, leaves the
+// original where it was, can be cloned again, and outlives the grammar it was taken from. The clones share the rules by
+// default and copy them with LLAMA_GRAMMAR_SHARE_RULES=0: the test holds either way
+static void test_clone() {
+    fprintf(stdout, "Testing grammar clones\n");
+    const std::string grammar_str = R"""(
+root   ::= "[" ws item ("," ws item)* "]"
+item   ::= "{" ws "\"k\"" ws ":" ws value "}"
+value  ::= number | "\"" [a-z]* "\""
+number ::= [0-9]+
+ws     ::= [ \t\n]*
+)""";
+    const std::string head     = "[{\"k\": 12}, {\"k\": \"ab";
+    const std::string tail_ok  = "c\"}]";
+    const std::string tail_bad = "c\"}}";
+
+    llama_grammar * g = build_grammar(grammar_str);
+    assert(g != nullptr);
+    assert(!match_string(head, g));                      // not complete yet ...
+    assert(!llama_grammar_get_stacks(g).empty());        // ... but still matching
+    const llama_grammar_stacks stacks_at_clone = llama_grammar_get_stacks(g);
+
+    llama_grammar * c1 = llama_grammar_clone_impl(*g);
+    llama_grammar * c2 = llama_grammar_clone_impl(*g);
+    llama_grammar * c3 = llama_grammar_clone_impl(*c1);  // a clone of a clone
+    assert(c1 != nullptr && c2 != nullptr && c3 != nullptr);
+    for (llama_grammar * c : { c1, c2, c3 }) {
+        const llama_grammar_stacks & sc = llama_grammar_get_stacks(c);
+        assert(sc.size() == stacks_at_clone.size());
+        for (size_t i = 0; i < sc.size(); ++i) {
+            assert(sc[i].size() == stacks_at_clone[i].size());
+            for (size_t j = 0; j < sc[i].size(); ++j) {
+                // the same element of the same rules (shared: the same address; copied: the same content)
+                assert(sc[i][j]->type == stacks_at_clone[i][j]->type && sc[i][j]->value == stacks_at_clone[i][j]->value);
+            }
+        }
+    }
+
+    assert(match_string(tail_ok, c1));                   // a clone completes the input
+    assert(!match_string(tail_bad, c2));                 // another one refuses a wrong end
+    assert(llama_grammar_get_stacks(g) == stacks_at_clone); // the original did not move
+    llama_grammar_free_impl(c1);
+    llama_grammar_free_impl(c2);
+    assert(match_string(tail_ok, g));                    // and completes the input itself after its clones are gone
+    llama_grammar_free_impl(g);
+    assert(match_string(tail_ok, c3));                   // a clone outlives its source
+    llama_grammar_free_impl(c3);
+}
+
 int main() {
     fprintf(stdout, "Running grammar integration tests...\n");
     test_simple_grammar();
@@ -1490,6 +1539,7 @@ int main() {
     test_failure_missing_root_symbol();
     test_custom_root_symbol_check();
     test_json_schema();
+    test_clone();
     fprintf(stdout, "All tests passed.\n");
     return 0;
 }

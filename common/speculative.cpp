@@ -3263,6 +3263,39 @@ int32_t common_speculative_n_max(const common_speculative * spec) {
     return n_max;
 }
 
+// [TAG_SPEC_PROMPT_LAZY] the draft-model implementations never read the draft params' prompt; any other type may
+bool common_speculative_needs_prompt(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+    for (const auto & impl : spec->impls) {
+        switch (impl->type) {
+            case COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
+            case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                break;
+            default:
+                return true;
+        }
+    }
+    return false;
+}
+
+// [TAG_SPEC_PROCESS_EARLY] only the DFlash implementations' process() was checked for this order (see the declaration)
+bool common_speculative_process_early_ok(const common_speculative * spec) {
+    if (spec == nullptr || spec->impls.empty()) {
+        return false;
+    }
+    for (const auto & impl : spec->impls) {
+        if (impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && impl->type != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::vector<double> common_speculative_synth_rates_resolve(const common_params_speculative * spec, int32_t n_max) {
     const bool has_length = spec->synth_len != -1.0;
     const bool has_rates  = !spec->synth_rates.empty();
