@@ -823,7 +823,7 @@ cached per uid (20-50 us). Two findings of the review are not host work and are 
 loses the rejection step once a tool call's grammar has triggered (`common_sampler_rejection_row_ok`), and the
 streaming verify kernel reads a Q8_0 cache at about 306 GB/s where it reads an F16 one at 659 (section 1's numbers).
 
-## 31. Rejection sampling inside tool calls, and the graph check kept per graph (branch spec-next)
+## 31. Rejection sampling inside tool calls, and the graph check kept per graph (2026-11-09: tool-call bodies +4.5%, decode +0.3 to +0.4%)
 
 Two of the review's items of section 30, measured on 2026-11-09 with the same method (fixed requests, identical outputs
 where the change is exact, alternating servers).
