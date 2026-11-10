@@ -822,3 +822,52 @@ change, 0.3-0.6 ms, to write with the card at hand and `LLAMA_RS_REPLAY_SELFTEST
 cached per uid (20-50 us). Two findings of the review are not host work and are not in this branch: a drafted row
 loses the rejection step once a tool call's grammar has triggered (`common_sampler_rejection_row_ok`), and the
 streaming verify kernel reads a Q8_0 cache at about 306 GB/s where it reads an F16 one at 659 (section 1's numbers).
+
+## 31. Rejection sampling inside tool calls, and the graph check kept per graph (branch spec-next)
+
+Two of the review's items of section 30, measured on 2026-11-09 with the same method (fixed requests, identical outputs
+where the change is exact, alternating servers).
+
+**The rejection step under a tool call's grammar** (`TAG_SPEC_REJECTION_GRAMMAR`, `LLAMA_SPEC_REJECTION_GRAMMAR`,
+default 1; 0: as before; 2: under any grammar). Once a lazy grammar had triggered, a drafted row lost the rejection
+step: the draft proposed its argmax and the verify sampled the target and compared, so a tool call's body, where a
+coding agent writes its files, decoded on the sample-and-match rule (with `LLAMA_SPEC_REJECTION=0` its output did not
+change by a token). `common_sampler_sample` draws from the chain and keeps the token when it fits the grammar; only a
+token that does not fit sends it to a second draw with the grammar first. So on a row where every candidate with
+probability fits the grammar, the chain's distribution is the row's distribution, and the rejection step is exact
+there. Now such a row takes the step (the token step and the block verification both), the draft's q is its candidates
+that fit, renormalized, and a row with a candidate that does not fit keeps the two draws. Not at temperature 0 (the
+step cannot gain there) and by default not under a grammar that is not lazy: a JSON schema's grammar costs more to
+read than the step gains (a schema of 12 fixed objects lost 4% with it, 86.9 against 90.7 tok/s).
+- The write-tool task of section 30's probe at temperature 1.0, eight seeds: 142.0 tok/s against 135.8 (+4.5%),
+  acceptance 0.710 against 0.669. Every row read through the grammar had only candidates that fit (3,082 of 3,082 in
+  the first three seeds), so no row fell back.
+- For scale: the same file written as plain content decodes at 160 tok/s with the rejection step (acceptance 0.787)
+  and 143 without (0.699); the tool call's JSON string is harder for the draft.
+- The distribution is the target's: over 60 seeds the first tool called was write 51, grep 8, glob 1 with the step and
+  50, 9, 1 without. The greedy requests and every request without tools give the outputs of the previous build,
+  character for character; a seeded request with tools gives another sample of the same distribution, as the
+  rejection step always did for plain text.
+- `test-spec-draft-grammar` checks the draft's pick under a triggered grammar (q holds only candidates that fit, sums
+  to 1, the pick is accepted by the grammar; nothing fits: no pick).
+
+**The graph compatibility walk kept per graph uid** (`TAG_CG_COMPAT_CACHE`, `LLAMA_CG_COMPAT_CACHE=0` walks every
+time). Before each launch the backend walked every node of the graph to decide whether it may run as a CUDA graph:
+98.5 us on the verify graph's 4,574 nodes, 17 us on each of the drafter's two, all before the launch, the GPU idle.
+The answer depends on the nodes' ops, shapes and weights only, so a graph with the uid the walk last ran on keeps its
+answer (the reuse `ggml_cuda_graph_update_required` already trusts). Outputs identical on the 17 requests; the walk
+falls to 1 us a round, the host round by 118 us (41,716 -> 41,598), and the decode rate rises 0.3 to 0.4% on every
+request in two alternating passes each (143.6 against 143.2 tok/s on the tool-call write).
+
+Measured and not built: the forward's ring writes. An nsys node trace of decode shows 96 `k_set_rows` a round at
+3.1 us each on the target's stream, 0.3 ms a round, 0.7%: the ceiling of fusing them, half in the conv-slots kernel
+(the x ring) and half in the gated delta net kernel (the alpha/beta ring).
+
+The streaming verify kernel on a Q8_0 cache (branch `q8-fvs`, experiments, all off): 462-473 us a call at 65,536 keys
+x 8 tokens, an F16 cache 394-399. Fewer or wider loads do not help (two 8-byte loads with a word select 502-506; the
+scale by a shuffle 476-481; per-thread offsets 461-467), and neither does reading each row from global memory once
+with the raw rows staged in shared memory (K rows 462, V rows 462-468, both exact). The probes say why: the time is in
+the PV warps' product loop, their reads and their widening (one read a lane on V alone: 375; no widening on V: 432),
+and the QK warps have room. A probe that has the QK warps load and widen 3/8 of each V tile into shared memory as F16,
+the PV warps reading it with one load, runs in 429 us (4/8: 431, 5/8: 443): about 8.5% of the kernel, which is 2% of a
+round at 100k and 3% at 200k. The exact version needs the V part's hand-over between the two groups.
