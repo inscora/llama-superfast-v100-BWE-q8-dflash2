@@ -54,6 +54,14 @@ struct smem_t {
     float m[NR];
 };
 
+// [TAG_FVS_Q8_ROW1] the raw K rows of the four QK warps (16 rows of 272 bytes each) follow smem_t
+constexpr size_t SM_KR    = (sizeof(smem_t) + 15) & ~(size_t) 15;
+constexpr size_t SM_BYTES = SM_KR + 4*16*272;
+// [TAG_FVS_Q8_ROW1V] or, in the V variant, the raw V strips of the four PV warps (64 rows x 80 bytes each)
+constexpr size_t SM_BYTES_V = SM_KR + 4*64*80;
+// probe (VAR & 16384): half a V tile as F16 (32 rows), widened by the QK warps
+constexpr size_t SM_BYTES_HB = SM_KR + 40*KST*sizeof(half);   // up to 40 rows (5/8 of a tile)
+
 static __device__ __forceinline__ void mma_rc(float (&c)[8], const uint32_t a0, const uint32_t a1, const uint32_t b0, const uint32_t b1) {
     asm("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};"
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
@@ -265,6 +273,13 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
     constexpr int  Q8P = (VAR >> 6) & 3;    // VAR & 192: timing probes with wrong output (1: one load a lane, 2: no widening, 3: both)
     constexpr bool Q8X  = KVQ8 && (VAR & 768) != 0;   // VAR & 256: the Q8_0 loads at per-thread offsets, d by shuffle (ld_row8c, [TAG_FVS_Q8_LD3])
     constexpr bool Q8SD = (VAR & 256) != 0;            // VAR & 512: the same offsets, d loaded
+    constexpr bool Q8R  = KVQ8 && (VAR & 1024) != 0;  // VAR & 1024: each K row read from global memory once ([TAG_FVS_Q8_ROW1])
+    static_assert(!Q8R || KP == 0, "the staged K rows are loaded by the QK warps");
+    constexpr int  Q8PK = (VAR & 2048) != 0 ? 0 : Q8P;   // VAR & 2048: the probes on the V loads only (K as usual)
+    constexpr bool Q8RV = KVQ8 && (VAR & 8192) != 0;    // VAR & 8192: each V row's bytes read from global memory once ([TAG_FVS_Q8_ROW1V])
+    constexpr bool Q8HB = KVQ8 && (VAR & 16384) != 0;   // VAR & 16384: timing probe, wrong output: the QK warps load and widen half of each V tile into shared memory, the PV warps read it as F16
+    constexpr int  HBC  = (VAR & 32768) != 0 ? 5 : (VAR & 65536) != 0 ? 3 : 4;   // the probe's share of a V tile, in eighths
+    constexpr bool Q8VS = KVQ8 && (VAR & 4096) != 0;    // VAR & 4096: probe, wrong output: a V lane's load as one global word and three shared-memory reads
 
     // this block's 8-token half; Q, the mask and the outputs from its first token on
     const int hf    = blockIdx.x % nhalf;
@@ -340,23 +355,74 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
     // The two groups have separate loops (their register state is disjoint); both cross the same barriers nt + 2 times.
     if (isQK) {
         uint4 kreg[KQ > 0 ? KQ : 1];
+        // [TAG_FVS_Q8_ROW1] a Q8_0 K row is 272 bytes, 17 chunks of 16. Here the warp reads its 16 rows of a tile as their
+        // 272 chunks, one 16-byte load a lane and 9 loads a tile (each row's bytes read from global memory once, where
+        // the per-lane loads read them four times over: 64 loads a tile), keeps them in registers one tile ahead as
+        // before, then lays the rows down raw in a private strip of shared memory and widens each lane's 8 dims from
+        // there (the same words, so the same K tile bit for bit). Chunks past the 272nd repeat the last one
+        constexpr int NKR = (16*17 + 31)/32;
+        uint4 kraw[Q8R ? NKR : 1];
+        uint4 kx[Q8HB ? 2*HBC : 1];
+        int   kgo[Q8R ? NKR : 1], kso[Q8R ? NKR : 1];
+        unsigned char * const krw = smem_raw + SM_KR + (w & 3)*(16*272);
+        q8ld_t krld = {};
+        if constexpr (Q8R) {
+#pragma unroll
+            for (int r = 0; r < NKR; ++r) {
+                const int g = min(r*32 + lane, 16*17 - 1);
+                kgo[r] = (g/17)*4*(int) nbk1 + 16*(g%17);
+                kso[r] = (g/17)*272 + 16*(g%17);
+            }
+            krld = q8ld_make((const char *) krw + kofs, kq, 0);
+        }
+        const auto k_load = [&](const int64_t key) {   // the K tile at key into registers
+            if constexpr (Q8R) {
+                const char * tp = Kbase + (key + w)*nbk1;
+#pragma unroll
+                for (int r = 0; r < NKR; ++r) kraw[r] = __ldg((const uint4 *)(tp + kgo[r]));
+            } else {
+                const char * kp = Kbase + (key + w)*nbk1 + kofs;
+#pragma unroll
+                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = (Q8X ? ld_row8c<Q8SD>(kp, kld) : ld_row8<KVQ8, Q8W, Q8PK>(kp, kq));
+                if constexpr (Q8HB) {
+                    const char * xp = V + kvh*nbv2 + (key + w)*nbv1 + kofs;
+#pragma unroll
+                    for (int rr = 0; rr < 2*HBC; ++rr, xp += 4*nbv1) kx[rr] = ld_row8<KVQ8, Q8W, 0>(xp, kq);
+                }
+            }
+        };
+        const auto k_store = [&]() {                    // the registers' K tile into shared memory, as F16
+            if constexpr (Q8R) {
+#pragma unroll
+                for (int r = 0; r < NKR; ++r) *(uint4 *)(krw + kso[r]) = kraw[r];
+#pragma unroll
+                for (int rr = 0; rr < KQ; ++rr) {
+                    const unsigned char * bp = krw + rr*272 + kofs;
+                    const uint32_t w0 = *(const uint32_t *)(bp + krld.o0), w1 = *(const uint32_t *)(bp + krld.o1), w2 = *(const uint32_t *)(bp + krld.o2);
+                    const uint32_t d  = *(const unsigned short *) bp;
+                    *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] =
+                        to_f16x8<KVQ8, Q8PK>(make_uint4(__funnelshift_rc(w0, w1, krld.sh), __funnelshift_rc(w1, w2, krld.sh), d, 0));
+                }
+            } else {
+#pragma unroll
+                for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8, Q8PK>(kreg[rr]);
+                if constexpr (Q8HB) {
+                    half * vf = (half *)(smem_raw + SM_KR);
+#pragma unroll
+                    for (int rr = 0; rr < 2*HBC; ++rr) *(uint4 *) &vf[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8, 0>(kx[rr]);
+                }
+            }
+        };
         float mrun[3][4], lrun[3][4];
 #pragma unroll
         for (int t = 0; t < 3; ++t)
 #pragma unroll
             for (int j = 0; j < 4; ++j) { mrun[t][j] = -INFINITY; lrun[t][j] = 0.0f; }
         if (KQ > 0 && nt > 0) {
-            {
-                const char * kp = Kbase + (key0(0) + w)*nbk1 + kofs;
-#pragma unroll
-                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = (Q8X ? ld_row8c<Q8SD>(kp, kld) : ld_row8<KVQ8, Q8W, Q8P>(kp, kq));
-            }
-#pragma unroll
-            for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8, Q8P>(kreg[rr]);
+            k_load(key0(0));
+            k_store();
             if (nt > 1) {
-                const char * kp = Kbase + (key0(1) + w)*nbk1 + kofs;
-#pragma unroll
-                for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = (Q8X ? ld_row8c<Q8SD>(kp, kld) : ld_row8<KVQ8, Q8W, Q8P>(kp, kq));
+                k_load(key0(1));
             }
         }
         __syncthreads();
@@ -473,13 +539,10 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
 
                 // the next K tile (loaded one iteration ago) into shared memory, then the one after it into registers
                 if (has_next) {
-#pragma unroll
-                    for (int rr = 0; rr < KQ; ++rr) *(uint4 *) &s.K[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8, Q8P>(kreg[rr]);
+                    k_store();
                     if (tid < 64) *(uint4 *) &s.M[b ^ 1][(tid >> 3)*MST + 8*(tid & 7)] = mnext;
                     if (KQ > 0 && j + 2 < nt) {
-                        const char * kp = Kbase + (key0(j + 2) + w)*nbk1 + kofs;
-#pragma unroll
-                        for (int rr = 0; rr < KQ; ++rr, kp += 4*nbk1) kreg[rr] = (Q8X ? ld_row8c<Q8SD>(kp, kld) : ld_row8<KVQ8, Q8W, Q8P>(kp, kq));
+                        k_load(key0(j + 2));
                     }
                 }
             }
@@ -519,6 +582,51 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
     } else {
         float O[2][NT][8];
         uint4 vreg[16];
+        const auto v_load = [&](const char * vp) -> uint4 {
+            if constexpr (Q8VS) {
+                const uint32_t w0 = __ldg((const uint32_t *)((uintptr_t)(vp + 2 + vq) & ~(uintptr_t) 3));
+                const unsigned char * sp = (const unsigned char *) &s.Q[0] + ((uintptr_t) vp & 0x3f0) + 16*lane;   // words that vary with the row
+                const uint32_t w1 = *(const uint32_t *)(sp + 4), w2 = *(const uint32_t *)(sp + 8), d = *(const unsigned short *) sp;
+                return make_uint4(__funnelshift_rc(w0, w1, 16), __funnelshift_rc(w1, w2, 16), (d & 0x03ffu) | 0x3000u, 0);
+            } else {
+                return (Q8X ? ld_row8c<Q8SD>(vp, vld) : ld_row8<KVQ8, Q8W, Q8P>(vp, vq));
+            }
+        };
+        // [TAG_FVS_Q8_ROW1V] a PV warp owns 64 dims of every V row: two Q8_0 blocks, 68 bytes, inside 5 chunks of 16 (80
+        // bytes from byte 64*(w & 3) of the row). Here the warp reads a tile's 64 rows as those 320 chunks, one 16-byte
+        // load a lane and 10 loads a tile (where the per-lane loads are 64 a tile), holds them in registers one tile
+        // ahead as before, lays them down raw in its own strip of shared memory when the tile's turn comes, and each
+        // lane widens its 8 dims from there: the same words, so the same V fragments bit for bit
+        constexpr int NVR = 10;
+        uint4 vraw[Q8RV ? NVR : 1];
+        int   vgo[Q8RV ? NVR : 1], vso[Q8RV ? NVR : 1];
+        unsigned char * const vrw = smem_raw + SM_KR + (w & 3)*(64*80);
+        const int vbo = 4*(w & 3) + 34*(qp >> 1);   // the lane's block in a strip row
+        q8ld_t vrld = {};
+        if constexpr (Q8RV) {
+#pragma unroll
+            for (int r = 0; r < NVR; ++r) {
+                const int g = r*32 + lane;
+                vgo[r] = (g/5)*(int) nbv1 + 16*(4*(w & 3) + g%5);
+                vso[r] = (g/5)*80 + 16*(g%5);
+            }
+            vrld = q8ld_make((const char *) vrw + vbo, vq, 0);
+        }
+        const auto vt_load = [&](const int64_t key) {   // the V tile at key into registers
+            const char * tp = V + kvh*nbv2 + key*nbv1;
+#pragma unroll
+            for (int r = 0; r < NVR; ++r) vraw[r] = __ldg((const uint4 *)(tp + vgo[r]));
+        };
+        const auto vt_store = [&]() {
+#pragma unroll
+            for (int r = 0; r < NVR; ++r) *(uint4 *)(vrw + vso[r]) = vraw[r];
+        };
+        const auto vt_row = [&](const int row) -> uint4 {   // the lane's 8 dims of a strip row, raw
+            const unsigned char * bp = vrw + row*80 + vbo;
+            const uint32_t w0 = *(const uint32_t *)(bp + vrld.o0), w1 = *(const uint32_t *)(bp + vrld.o1), w2 = *(const uint32_t *)(bp + vrld.o2);
+            const uint32_t d  = *(const unsigned short *) bp;
+            return make_uint4(__funnelshift_rc(w0, w1, vrld.sh), __funnelshift_rc(w1, w2, vrld.sh), d, 0);
+        };
         uint4 kreg[KP > 0 ? KP : 1];
 #pragma unroll
         for (int u = 0; u < 2; ++u)
@@ -527,9 +635,13 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
 #pragma unroll
                 for (int i = 0; i < 8; ++i) O[u][t][i] = 0.0f;
         if (nt > 0) {
-            const char * vp = Vbase + key0(0)*nbv1;
+            if constexpr (Q8RV) {
+                vt_load(key0(0));
+            } else {
+                const char * vp = Vbase + key0(0)*nbv1;
 #pragma unroll
-            for (int q = 0; q < 16; ++q, vp += 4*nbv1) vreg[q] = (Q8X ? ld_row8c<Q8SD>(vp, vld) : ld_row8<KVQ8, Q8W, Q8P>(vp, vq));
+                for (int q = 0; q < 16; ++q, vp += 4*nbv1) vreg[q] = v_load(vp);
+            }
         }
         if constexpr (KP > 0) {   // the PV group owns the last KP rows of the K tile's load and its store to shared memory
             const int wk = w & 3;
@@ -572,12 +684,29 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                 const bool has_next = j < nt;
                 const char * vp = Vbase + (has_next ? key0(j) : 0)*nbv1;
 #ifndef FVS_SKIP_PV
+                if constexpr (Q8RV) {
+                    vt_store();
+                    if (has_next) {
+                        vt_load(key0(j));
+                    }
+                }
 #pragma unroll
                 for (int c = 0; c < TK/8; ++c) {
-                    const uint4 v0 = to_f16x8<KVQ8, Q8P>(vreg[2*c]), v1 = to_f16x8<KVQ8, Q8P>(vreg[2*c + 1]);
-                    if (has_next) {
-                        vreg[2*c]     = (Q8X ? ld_row8c<Q8SD>(vp, vld) : ld_row8<KVQ8, Q8W, Q8P>(vp, vq));
-                        vreg[2*c + 1] = (Q8X ? ld_row8c<Q8SD>(vp + 4*nbv1, vld) : ld_row8<KVQ8, Q8W, Q8P>(vp + 4*nbv1, vq));
+                    uint4 v0, v1;
+                    if constexpr (Q8RV) {
+                        v0 = to_f16x8<KVQ8, Q8P>(vt_row(l4 + 8*c));
+                        v1 = to_f16x8<KVQ8, Q8P>(vt_row(l4 + 8*c + 4));
+                    } else if (Q8HB && c < HBC) {
+                        const half * vf = (const half *)(smem_raw + SM_KR);
+                        v0 = *(const uint4 *) &vf[(l4 + 8*c)*KST + vd];
+                        v1 = *(const uint4 *) &vf[(l4 + 8*c + 4)*KST + vd];
+                    } else {
+                        v0 = to_f16x8<KVQ8, Q8P>(vreg[2*c]);
+                        v1 = to_f16x8<KVQ8, Q8P>(vreg[2*c + 1]);
+                        if (has_next) {
+                            vreg[2*c]     = v_load(vp);
+                            vreg[2*c + 1] = v_load(vp + 4*nbv1);
+                        }
                     }
                     vp += 8*nbv1;
 #pragma unroll

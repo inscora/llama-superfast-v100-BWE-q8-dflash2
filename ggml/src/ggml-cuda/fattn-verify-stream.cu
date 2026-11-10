@@ -163,7 +163,7 @@ void ggml_cuda_flash_attn_ext_verify_stream(ggml_backend_cuda_context & ctx, ggm
     static const bool q8_w   = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_W");  return !e || atoi(e) != 0; }();
     const bool kv_q8 = K->type == GGML_TYPE_Q8_0;
     // timing probes of the Q8_0 path, wrong output (LLAMA_FATTN_VERIFY_STREAM_Q8_PROBE = 1: one load a lane, 2: no widening, 3: both)
-    static const int q8_probe = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_PROBE"); return e ? atoi(e) & 3 : 0; }();
+    static const int q8_probe = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_PROBE"); return e ? atoi(e) & 7 : 0; }();
     if (kv_q8 && q8_probe != 0) {
         CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 +  64, true>), nbytes_shared);
         CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 128, true>), nbytes_shared);
@@ -177,7 +177,53 @@ void ggml_cuda_flash_attn_ext_verify_stream(ggml_backend_cuda_context & ctx, ggm
         CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 256, true>), nbytes_shared);
         CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 512, true>), nbytes_shared);
     }
-    (kv_q8 && q8_probe == 0 && q8_ld == 1 ? fvs::verify_stream<6, false, 32 + 256, true> :
+    // [TAG_FVS_Q8_ROW1] LLAMA_FATTN_VERIFY_STREAM_Q8_ROW1=1: each Q8_0 K row read from global memory once (16-byte loads, raw
+    // rows staged in shared memory); the V rows as before. Its own launch: the strip needs more shared memory
+    static const int q8_row1 = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_ROW1"); return e ? atoi(e) : 0; }();
+    if (kv_q8 && q8_probe == 4) {
+        // probe 4, wrong output: part of each V tile loaded and widened by the QK warps, read as F16 by the PV warps
+        // (LLAMA_FATTN_VERIFY_STREAM_Q8_HB = 3, 4 or 5 eighths of the tile; 4 by default)
+        static const int hb = [] { const char * e = getenv("LLAMA_FATTN_VERIFY_STREAM_Q8_HB"); return e ? atoi(e) : 4; }();
+        const auto fn = hb == 5 ? fvs::verify_stream<6, false, 32 + 16384 + 32768, true> :
+                        hb == 3 ? fvs::verify_stream<6, false, 32 + 16384 + 65536, true> : fvs::verify_stream<6, false, 32 + 16384, true>;
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 16384, true>), fvs::SM_BYTES_HB);
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 16384 + 32768, true>), fvs::SM_BYTES_HB);
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 16384 + 65536, true>), fvs::SM_BYTES_HB);
+        fn<<<dim3(nsplit*nkvh*nhalf, n_strm, 1), fvs::NTH, fvs::SM_BYTES_HB, stream>>>(
+            (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+            (float *) dst->data, parts.ptr, meta.ptr, n_tok, n_head, nkvh,
+            Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1], n_kv, kv_count, nsplit, scale*1.4426950408889634f, nhalf,
+            Q->nb[3], K->nb[3], V->nb[3], mask->nb[3], use_list ? tlist.ptr : nullptr, use_list ? tcount.ptr : nullptr, tstride);
+    } else if (kv_q8 && q8_probe == 0 && q8_ld == 0 && q8_row1 == 2 && V->nb[1] == 272) {
+        // [TAG_FVS_Q8_ROW1V] =2: the V rows read once (the PV warps' strips), the K rows as usual
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 8192, true>), fvs::SM_BYTES_V);
+        fvs::verify_stream<6, false, 32 + 8192, true><<<dim3(nsplit*nkvh*nhalf, n_strm, 1), fvs::NTH, fvs::SM_BYTES_V, stream>>>(
+            (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+            (float *) dst->data, parts.ptr, meta.ptr, n_tok, n_head, nkvh,
+            Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1], n_kv, kv_count, nsplit, scale*1.4426950408889634f, nhalf,
+            Q->nb[3], K->nb[3], V->nb[3], mask->nb[3], use_list ? tlist.ptr : nullptr, use_list ? tcount.ptr : nullptr, tstride);
+    } else if (kv_q8 && q8_probe == 0 && q8_ld == 0 && q8_row1 == 1 && K->nb[1] == 272) {
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 1024, true>), fvs::SM_BYTES);
+        fvs::verify_stream<6, false, 32 + 1024, true><<<dim3(nsplit*nkvh*nhalf, n_strm, 1), fvs::NTH, fvs::SM_BYTES, stream>>>(
+            (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+            (float *) dst->data, parts.ptr, meta.ptr, n_tok, n_head, nkvh,
+            Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1], n_kv, kv_count, nsplit, scale*1.4426950408889634f, nhalf,
+            Q->nb[3], K->nb[3], V->nb[3], mask->nb[3], use_list ? tlist.ptr : nullptr, use_list ? tcount.ptr : nullptr, tstride);
+    } else if (kv_q8 && q8_probe >= 5) {
+        // V-only probes, wrong output: 5 one load a lane, 6 no widening, 7 one global word and three shared-memory reads
+        const auto fn = q8_probe == 5 ? fvs::verify_stream<6, false, 32 + 64 + 2048, true> :
+                        q8_probe == 6 ? fvs::verify_stream<6, false, 32 + 128 + 2048, true> : fvs::verify_stream<6, false, 32 + 4096, true>;
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 64 + 2048, true>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 128 + 2048, true>), nbytes_shared);
+        CUDA_SET_SHARED_MEMORY_LIMIT((fvs::verify_stream<6, false, 32 + 4096, true>), nbytes_shared);
+        fn<<<dim3(nsplit*nkvh*nhalf, n_strm, 1), fvs::NTH, nbytes_shared, stream>>>(
+            (const float *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data,
+            (float *) dst->data, parts.ptr, meta.ptr, n_tok, n_head, nkvh,
+            Q->nb[1], Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2], mask->nb[1], n_kv, kv_count, nsplit, scale*1.4426950408889634f, nhalf,
+            Q->nb[3], K->nb[3], V->nb[3], mask->nb[3], use_list ? tlist.ptr : nullptr, use_list ? tcount.ptr : nullptr, tstride);
+    } else
+    (kv_q8 && q8_probe == 0 && q8_ld == 1 ?
+ fvs::verify_stream<6, false, 32 + 256, true> :
      kv_q8 && q8_probe == 0 && q8_ld == 2 ? fvs::verify_stream<6, false, 32 + 512, true> :
      kv_q8 && q8_probe == 1 ? fvs::verify_stream<6, false, 32 +  64, true> :
      kv_q8 && q8_probe == 2 ? fvs::verify_stream<6, false, 32 + 128, true> :
