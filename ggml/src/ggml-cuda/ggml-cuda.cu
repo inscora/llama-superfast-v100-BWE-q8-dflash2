@@ -8003,7 +8003,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t back
         bool graph_compatible;
         {
             GGML_RT_SCOPE("cg.compat");
-            graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+            // [TAG_CG_COMPAT_CACHE] the walk reads every node (about 100 us on the verify graph's 4,574, before its
+            // launch, the GPU idle) and its answer depends on the nodes' ops, shapes and weights only: a graph with the
+            // uid it last ran on (the reuse ggml_cuda_graph_update_required trusts the same way) keeps that answer.
+            // LLAMA_CG_COMPAT_CACHE=0 walks every time, as before
+            static const bool compat_cache = [] { const char * e = getenv("LLAMA_CG_COMPAT_CACHE"); return e == nullptr || atoi(e) != 0; }();
+            if (compat_cache && cgraph->uid != 0 && cgraph->uid == graph->compat_uid) {
+                graph_compatible = graph->compat_ok;
+                GGML_RT_COUNT("cg.compat_reuse", 1);
+            } else {
+                graph_compatible   = ggml_cuda_graph_check_compability(cgraph);
+                graph->compat_uid  = cgraph->uid;
+                graph->compat_ok   = graph_compatible;
+            }
         }
         if (graph_compatible) {
             bool properties_changed;
