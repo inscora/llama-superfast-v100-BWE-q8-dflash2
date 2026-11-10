@@ -62,7 +62,7 @@ constexpr size_t SM_BYTES_V = SM_KR + 4*64*80;
 // probe (VAR & 16384): half a V tile as F16 (32 rows), widened by the QK warps
 constexpr size_t SM_BYTES_HB = SM_KR + 40*KST*sizeof(half);   // up to 40 rows (5/8 of a tile)
 // [TAG_FVS_Q8_VB] the first c eighths of a V tile (8*c rows) as F16, widened by the QK warps
-constexpr size_t sm_bytes_vb(const int c) { return SM_KR + (size_t) 8*c*KST*sizeof(half); }
+constexpr size_t sm_bytes_vb(const int c, const int nbuf = 1) { return SM_KR + (size_t) nbuf*8*c*KST*sizeof(half); }
 
 static __device__ __forceinline__ void mma_rc(float (&c)[8], const uint32_t a0, const uint32_t a1, const uint32_t b0, const uint32_t b1) {
     asm("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, {%0,%1,%2,%3,%4,%5,%6,%7};"
@@ -185,43 +185,86 @@ static __device__ __forceinline__ uint4 to_f16x8(const uint4 r) {
 }
 
 // [TAG_FVS_SKIP] the tiles of TK keys where any of the 8-token half's rows is unmasked, per (half, stream): blockIdx.x = half,
-// blockIdx.y = stream, 256 threads. A masked key is -inf (0xFC00); this kernel is only taken without ALiBi or a softcap, so
-// any other value is a key the row reads. The flags go to shared memory, then warp 0 compacts them by ballot into
-// list[(stream*nhalf + half)*tstride ..] and their number into count[stream*nhalf + half]. TMAX tiles at most (n_kv/TK)
+// blockIdx.y = stream. A masked key is -inf (0xFC00); this kernel is only taken without ALiBi or a softcap, so any other
+// value is a key the row reads. The used tiles go, in order, to list[(stream*nhalf + half)*tstride ..] and their number to
+// count[stream*nhalf + half]. TMAX tiles at most (n_kv/TK).
+// [TAG_FVS_SKIP_FAST] FAST: the list costs a twentieth of the attention it serves when one thread block of 256 reads the
+// whole mask (25 us at 65,536 keys x 8 tokens, where the tiles are all used). A tile is used as soon as one 8-key chunk of
+// one row is, so every tile is first tried on one chunk (its first, in the half's last row: one load a tile), and only
+// the tiles that chunk leaves open are read in full; and the list is compacted by every warp at once (a warp's 32 tiles
+// by ballot, its place from the counts of the warps before it) instead of by one warp tile after tile. The block may be
+// of any size (it is launched with 1024 threads)
 constexpr int TMAX = 8192;
+template <bool FAST>
 __global__ void tiles_used(const char * __restrict__ mask, const int64_t nbm1, const int64_t nbm3, const int n_tok_all, const int nhalf,
         const int n_kv, const int32_t * __restrict__ kv_count, int32_t * __restrict__ list, int32_t * __restrict__ count, const int tstride) {
     __shared__ unsigned char used[TMAX];
+    __shared__ int cnt[32];
     const int hf     = blockIdx.x;
     const int strm   = blockIdx.y;
     const int tok0   = 8*hf;
     const int n_tok  = min(8, n_tok_all - tok0);
     const int ntiles = min((kv_count ? *kv_count : n_kv) / TK, TMAX);
+    const int bd     = blockDim.x;
     mask += tok0*nbm1 + strm*nbm3;
-    // one thread per (tile, 8-key chunk): 8 halves of every row; a tile is used if any chunk of any row holds a non -inf value
-    for (int t = threadIdx.x; t < ntiles; t += blockDim.x) {
-        used[t] = 0;
+    const auto chunk_used = [&](const int tok, const int t, const int c) -> bool {   // 8 halves of a row
+        const uint4 v = *(const uint4 *)(mask + tok*nbm1 + (int64_t)(t*TK + 8*c)*2);
+        const uint32_t w[4] = { v.x, v.y, v.z, v.w };
+        bool u = false;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            u |= (w[k] & 0xFFFFu) != 0xFC00u || (w[k] >> 16) != 0xFC00u;
+        }
+        return u;
+    };
+    for (int t = threadIdx.x; t < ntiles; t += bd) {
+        used[t] = FAST && chunk_used(n_tok - 1, t, 0) ? 1 : 0;
     }
     __syncthreads();
-    for (int idx = threadIdx.x; idx < ntiles*(TK/8); idx += blockDim.x) {
+    // one thread per (tile, 8-key chunk): a tile is used if any chunk of any row holds a non -inf value
+    for (int idx = threadIdx.x; idx < ntiles*(TK/8); idx += bd) {
         const int t = idx / (TK/8), c = idx % (TK/8);
+        if (FAST && used[t]) {
+            continue;   // benign race with the writers below: they only write 1
+        }
         bool u = false;
         for (int tok = 0; tok < n_tok && !u; ++tok) {
-            const uint4 v = *(const uint4 *)(mask + tok*nbm1 + (int64_t)(t*TK + 8*c)*2);
-            const uint32_t w[4] = { v.x, v.y, v.z, v.w };
-#pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                u |= (w[k] & 0xFFFFu) != 0xFC00u || (w[k] >> 16) != 0xFC00u;
-            }
+            u = chunk_used(tok, t, c);
         }
         if (u) {
             used[t] = 1;   // benign race: every writer writes 1
         }
     }
     __syncthreads();
-    if (threadIdx.x < 32) {
-        const int lane = threadIdx.x;
-        int32_t * out = list + (int64_t)(strm*nhalf + hf)*tstride;
+    int32_t * out = list + (int64_t)(strm*nhalf + hf)*tstride;
+    const int lane = threadIdx.x & 31;
+    if constexpr (FAST) {
+        const int wi = threadIdx.x >> 5, nw = bd >> 5;   // bd is a multiple of 32, at most 1024
+        int n = 0;
+        for (int base = 0; base < ntiles; base += bd) {
+            const int t = base + threadIdx.x;
+            const bool u = t < ntiles && used[t];
+            const unsigned int bal = __ballot_sync(0xffffffff, u);
+            if (lane == 0) {
+                cnt[wi] = __popc(bal);
+            }
+            __syncthreads();
+            int pre = 0, tot = 0;
+            for (int k = 0; k < nw; ++k) {
+                const int c = cnt[k];
+                tot += c;
+                pre += k < wi ? c : 0;
+            }
+            if (u) {
+                out[n + pre + __popc(bal & ((1u << lane) - 1u))] = t;
+            }
+            n += tot;
+            __syncthreads();   // before the counts are written again
+        }
+        if (threadIdx.x == 0) {
+            count[strm*nhalf + hf] = n;
+        }
+    } else if (threadIdx.x < 32) {
         int n = 0;
         for (int base = 0; base < ntiles; base += 32) {
             const int t = base + lane;
@@ -289,6 +332,12 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
     // four PV warps, lays down tile j's part (in its registers since the iteration before) and requests tile j + 1's
     constexpr bool Q8VX = KVQ8 && (VAR & 131072) != 0;
     static_assert(!Q8VX || (KP == 0 && (VAR & (768 | 1024 | 4096 | 8192 | 16384)) == 0), "the shared V widening goes with the plain Q8_0 loads");
+    // VAR & 1048576 with it: the part double-buffered instead (tile j's in buffer j & 1), so the QK warps write one buffer
+    // while the PV warps read the other and the tile barrier is the only hand-over (no barrier 3); the same output.
+    // VAR & 524288: timing probe, wrong output: the single buffer with no barrier 3
+    constexpr bool Q8VD = Q8VX && (VAR & 1048576) != 0;
+    constexpr bool Q8VN = Q8VX && (VAR & 524288) != 0;
+    constexpr bool Q8VBAR = Q8VX && !Q8VD && !Q8VN;
     constexpr bool Q8HB = KVQ8 && (VAR & (16384 | 131072)) != 0;   // VAR & 16384: the timing probe of the above, wrong output (the part one tile early, no barrier)
     constexpr int  HBC  = (VAR & 32768) != 0 ? 5 : (VAR & 65536) != 0 ? 3 : (VAR & 262144) != 0 ? 2 : 4;   // the QK warps' share of a V tile, in eighths
     constexpr bool Q8VS = KVQ8 && (VAR & 4096) != 0;    // VAR & 4096: probe, wrong output: a V lane's load as one global word and three shared-memory reads
@@ -425,30 +474,30 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                 }
             }
         };
-        // [TAG_FVS_Q8_VB] the QK warps' part of the V tile at key: rows w, w + 4, .. of its first 8*HBC, this lane's 8 dims
-        const auto x_load = [&](const int64_t key) {
-            const char * xp = V + kvh*nbv2 + (key + w)*nbv1 + kofs;
-#pragma unroll
-            for (int rr = 0; rr < 2*HBC; ++rr, xp += 4*nbv1) kx[rr] = ld_row8<KVQ8, Q8W, 0>(xp, kq);
-        };
-        const auto x_store = [&]() {
-            half * vf = (half *)(smem_raw + SM_KR);
-#pragma unroll
-            for (int rr = 0; rr < 2*HBC; ++rr) *(uint4 *) &vf[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8, 0>(kx[rr]);
-        };
+        // [TAG_FVS_Q8_VB] the QK warps' part of a V tile: rows w, w + 4, .. of its first 8*HBC, this lane's 8 dims (the
+        // loops are written in place, below). kkey: the first key of the K tile in the registers, which is the tile
+        // whose V part is loaded next (the tile list is read once per tile)
+        const char * const Xbase = V + kvh*nbv2 + w*nbv1 + kofs;
+        int64_t kkey = 0;
         float mrun[3][4], lrun[3][4];
 #pragma unroll
         for (int t = 0; t < 3; ++t)
 #pragma unroll
             for (int j = 0; j < 4; ++j) { mrun[t][j] = -INFINITY; lrun[t][j] = 0.0f; }
         if (KQ > 0 && nt > 0) {
-            k_load(key0(0));
+            const int64_t k0 = key0(0);
+            k_load(k0);
             k_store();
             if (nt > 1) {
-                k_load(key0(1));
+                kkey = key0(1);
+                k_load(kkey);
+            }
+            if constexpr (Q8VX) {
+                const char * xp = Xbase + k0*nbv1;
+#pragma unroll
+                for (int rr = 0; rr < 2*HBC; ++rr, xp += 4*nbv1) kx[rr] = ld_row8<KVQ8, Q8W, 0>(xp, kq);
             }
         }
-        if constexpr (Q8VX) { if (nt > 0) x_load(key0(0)); }
         __syncthreads();
 
         for (int j = 0; j <= nt; ++j) {
@@ -562,18 +611,25 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                 }
 
                 // the next K tile (loaded one iteration ago) into shared memory, then the one after it into registers
+                const int64_t xkey = kkey;   // tile j + 1's first key
                 if (has_next) {
                     k_store();
                     if (tid < 64) *(uint4 *) &s.M[b ^ 1][(tid >> 3)*MST + 8*(tid & 7)] = mnext;
                     if (KQ > 0 && j + 2 < nt) {
-                        k_load(key0(j + 2));
+                        kkey = key0(j + 2);
+                        k_load(kkey);
                     }
                 }
                 if constexpr (Q8VX) {
-                    asm volatile("bar.sync 3, 256;" ::: "memory");   // every PV warp is done reading the part of tile j - 1
-                    x_store();                                        // tile j's part, read by the PV warps in iteration j + 1
-                    if (j + 1 < nt) {
-                        x_load(key0(j + 1));
+                    if constexpr (Q8VBAR) asm volatile("bar.sync 3, 256;" ::: "memory");   // every PV warp is done reading the part of tile j - 1
+                    // tile j's part, read by the PV warps in iteration j + 1
+                    half * vf = (half *)(smem_raw + SM_KR) + (Q8VD ? b*8*HBC*KST : 0);
+#pragma unroll
+                    for (int rr = 0; rr < 2*HBC; ++rr) *(uint4 *) &vf[(4*rr + w)*KST + 8*lane] = to_f16x8<KVQ8, 0>(kx[rr]);
+                    if (has_next) {
+                        const char * xp = Xbase + xkey*nbv1;
+#pragma unroll
+                        for (int rr = 0; rr < 2*HBC; ++rr, xp += 4*nbv1) kx[rr] = ld_row8<KVQ8, Q8W, 0>(xp, kq);
                     }
                 }
             }
@@ -696,7 +752,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
 
         for (int j = 0; j <= nt; ++j) {
             // [TAG_FVS_Q8_VB] nothing of the part is read in iteration 0: the QK warps may lay down tile 0's
-            if constexpr (Q8VX) { if (j == 0 && nt > 0) asm volatile("bar.arrive 3, 256;" ::: "memory"); }
+            if constexpr (Q8VBAR) { if (j == 0 && nt > 0) asm volatile("bar.arrive 3, 256;" ::: "memory"); }
             if (j >= 1) {
                 const int b = (j - 1) & 1;
                 const half * Prow = s.P[b] + (l4 + 4*hi)*PST;
@@ -728,12 +784,12 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                 for (int c = 0; c < TK/8; ++c) {
                     uint4 v0, v1;
                     // [TAG_FVS_Q8_VB] this warp has read its fragments of the QK warps' part (chunks 0 .. HBC - 1)
-                    if constexpr (Q8VX) { if (c == HBC && j < nt) asm volatile("bar.arrive 3, 256;" ::: "memory"); }
+                    if constexpr (Q8VBAR) { if (c == HBC && j < nt) asm volatile("bar.arrive 3, 256;" ::: "memory"); }
                     if constexpr (Q8RV) {
                         v0 = to_f16x8<KVQ8, Q8P>(vt_row(l4 + 8*c));
                         v1 = to_f16x8<KVQ8, Q8P>(vt_row(l4 + 8*c + 4));
                     } else if (Q8HB && c < HBC) {
-                        const half * vf = (const half *)(smem_raw + SM_KR);
+                        const half * vf = (const half *)(smem_raw + SM_KR) + (Q8VD ? b*8*HBC*KST : 0);
                         v0 = *(const uint4 *) &vf[(l4 + 8*c)*KST + vd];
                         v1 = *(const uint4 *) &vf[(l4 + 8*c + 4)*KST + vd];
                     } else {
@@ -755,7 +811,7 @@ __global__ void __launch_bounds__(NTH, 1) verify_stream(
                     }
                 }
 #else
-                if constexpr (Q8VX) { if (j < nt) asm volatile("bar.arrive 3, 256;" ::: "memory"); }
+                if constexpr (Q8VBAR) { if (j < nt) asm volatile("bar.arrive 3, 256;" ::: "memory"); }
 #endif
             }
             if constexpr (KP > 0) {
