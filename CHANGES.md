@@ -872,7 +872,7 @@ and the QK warps have room. A probe that has the QK warps load and widen 3/8 of 
 the PV warps reading it with one load, runs in 429 us (4/8: 431, 5/8: 443): about 8.5% of the kernel, which is 2% of a
 round at 100k and 3% at 200k. The exact version needs the V part's hand-over between the two groups.
 
-## 32. The verify kernel on a Q8_0 cache: the V widening shared between the warp groups, and a cheaper tile list (branch q8-fvs)
+## 32. The verify kernel on a Q8_0 cache: the V widening shared between the warp groups, and a cheaper tile list (2026-11-10: kernel -8.4%, decode at 100k +1.1 to +1.5%, outputs identical)
 
 Measured 2026-11-10 with `test-backend-ops perf` (4 KV heads x 6, 65,536 keys, 8 tokens, Q8_0), each variant
 alternated with the kernel as it was, then on the server with fixed requests whose outputs must be identical.
@@ -913,3 +913,5 @@ probe, the kernel as it was (`_SKIP_FAST=0 _Q8_VB=0`) against the defaults, two 
 output identical, no errors. Decode at 100k: 122.8 / 122.5 -> 124.2 / 124.3 tok/s (verbatim copy), 127.7 / 125.9 ->
 129.2 / 127.8 (write call, temperature 1), 109.0 / 108.9 -> 110.3 / 110.4 (prose, temperature 1): +1.1 to +1.5%.
 Shallow requests are unchanged (the kernel is a small share there).
+The release image against the one before it (the launcher, the same 21 requests): every output identical, no
+errors; at 100k 124.0 -> 125.6, 122.9 -> 124.5, 108.6 -> 110.0 tok/s. Merged to main.
